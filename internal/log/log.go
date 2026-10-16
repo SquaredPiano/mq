@@ -33,10 +33,24 @@ func (l *Log) Append(key, value []byte) uint64 {
 	defer l.mu.Unlock()
 
 	offset := l.startOffset + uint64(len(l.records))
+	totalBytes := len(key) + len(value)
+	var buf []byte
+	if totalBytes > 0 {
+		buf = make([]byte, totalBytes)
+		copy(buf, key)
+		copy(buf[len(key):], value)
+	}
+	var k, v []byte
+	if len(key) > 0 {
+		k = buf[:len(key)]
+	}
+	if len(value) > 0 {
+		v = buf[len(key):]
+	}
 	l.appendRecordLocked(Record{
 		Offset:    offset,
-		Key:       clone(key),
-		Value:     clone(value),
+		Key:       k,
+		Value:     v,
 		Timestamp: time.Now().UTC(),
 	})
 	return offset
@@ -61,13 +75,34 @@ func (l *Log) AppendRecords(records []Record) error {
 		}
 	}
 
-	cloned := make([]Record, len(records))
-	for i, record := range records {
-		record.Key = clone(record.Key)
-		record.Value = clone(record.Value)
-		cloned[i] = record
+	totalBytes := 0
+	for i := range records {
+		totalBytes += len(records[i].Key) + len(records[i].Value)
 	}
-	l.records = append(l.records, cloned...)
+	var buf []byte
+	if totalBytes > 0 {
+		buf = make([]byte, totalBytes)
+	}
+	pos := 0
+	for _, record := range records {
+		var k, v []byte
+		if len(record.Key) > 0 {
+			k = buf[pos : pos+len(record.Key)]
+			copy(k, record.Key)
+			pos += len(record.Key)
+		}
+		if len(record.Value) > 0 {
+			v = buf[pos : pos+len(record.Value)]
+			copy(v, record.Value)
+			pos += len(record.Value)
+		}
+		l.records = append(l.records, Record{
+			Offset:    record.Offset,
+			Key:       k,
+			Value:     v,
+			Timestamp: record.Timestamp,
+		})
+	}
 	return nil
 }
 
@@ -109,12 +144,34 @@ func (l *Log) readLocked(offset uint64, limit int) []Record {
 		end = start + limit
 	}
 
-	result := make([]Record, end-start)
+	count := end - start
+	totalBytes := 0
+	for i := start; i < end; i++ {
+		totalBytes += len(l.records[i].Key) + len(l.records[i].Value)
+	}
+
+	var buf []byte
+	if totalBytes > 0 {
+		buf = make([]byte, totalBytes)
+	}
+	result := make([]Record, count)
+	pos := 0
 	for i, record := range l.records[start:end] {
+		var k, v []byte
+		if len(record.Key) > 0 {
+			k = buf[pos : pos+len(record.Key)]
+			copy(k, record.Key)
+			pos += len(record.Key)
+		}
+		if len(record.Value) > 0 {
+			v = buf[pos : pos+len(record.Value)]
+			copy(v, record.Value)
+			pos += len(record.Value)
+		}
 		result[i] = Record{
 			Offset:    record.Offset,
-			Key:       clone(record.Key),
-			Value:     clone(record.Value),
+			Key:       k,
+			Value:     v,
 			Timestamp: record.Timestamp,
 		}
 	}
@@ -195,5 +252,10 @@ func (l *Log) EndOffset() uint64 {
 }
 
 func clone(value []byte) []byte {
-	return append([]byte(nil), value...)
+	if len(value) == 0 {
+		return nil
+	}
+	c := make([]byte, len(value))
+	copy(c, value)
+	return c
 }
