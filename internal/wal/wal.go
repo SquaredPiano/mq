@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -597,6 +598,153 @@ func (w *WAL) Size() (int64, error) {
 		return 0, err
 	}
 	return w.totalSize, nil
+}
+
+func (w *WAL) HashPrefix(offset int64) ([sha256.Size]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var digest [sha256.Size]byte
+	if err := w.readyLocked(); err != nil {
+		return digest, err
+	}
+	if offset < 0 || offset > w.totalSize {
+		return digest, fmt.Errorf("WAL prefix offset %d is outside WAL size %d", offset, w.totalSize)
+	}
+	if offset < w.base {
+		return digest, fmt.Errorf("WAL prefix offset %d is below the durable prefix %d", offset, w.base)
+	}
+
+	hasher := sha256.New()
+	position := w.base
+	for position < offset {
+		frame, _, err := w.readFrameAtLocked(position)
+		if err != nil {
+			return digest, err
+		}
+		if position+int64(len(frame)) > offset {
+			return digest, fmt.Errorf("WAL prefix offset %d is not on a frame boundary", offset)
+		}
+		_, _ = hasher.Write(frame)
+		position += int64(len(frame))
+	}
+	if position != offset {
+		return digest, fmt.Errorf("WAL prefix offset %d is not on a frame boundary", offset)
+	}
+	copy(digest[:], hasher.Sum(nil))
+	return digest, nil
+}
+
+func (w *WAL) ReadFrames(offset int64, maxBytes int) ([]byte, error) {
+	return w.ReadFramesUntil(offset, -1, maxBytes)
+}
+
+func (w *WAL) ReadFramesUntil(offset, end int64, maxBytes int) ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.readyLocked(); err != nil {
+		return nil, err
+	}
+	if end < 0 {
+		end = w.totalSize
+	}
+	if offset < 0 || offset > end || end > w.totalSize {
+		return nil, fmt.Errorf("WAL read range %d..%d is outside WAL size %d", offset, end, w.totalSize)
+	}
+	if offset < w.base {
+		return nil, fmt.Errorf("WAL read offset %d is below the durable prefix %d", offset, w.base)
+	}
+	if offset == end {
+		return []byte{}, nil
+	}
+	if maxBytes <= 0 {
+		return nil, errors.New("WAL frame read limit must be positive")
+	}
+
+	capacity := maxBytes
+	if available := end - offset; available < int64(capacity) {
+		capacity = int(available)
+	}
+	result := make([]byte, 0, capacity)
+	position := offset
+	for position < end {
+		frame, _, err := w.readFrameAtLocked(position)
+		if err != nil {
+			return nil, err
+		}
+		if position+int64(len(frame)) > end {
+			return nil, fmt.Errorf("WAL read end %d is not on a frame boundary", end)
+		}
+		if len(result) > 0 && len(result)+len(frame) > maxBytes {
+			break
+		}
+		result = append(result, frame...)
+		position += int64(len(frame))
+	}
+	return result, nil
+}
+
+func (w *WAL) AppendFrames(offset int64, data []byte) ([]Entry, error) {
+	return w.AppendFramesChecked(offset, data, nil)
+}
+
+func (w *WAL) AppendFramesChecked(offset int64, data []byte, validate func([]Entry) error) ([]Entry, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.readyLocked(); err != nil {
+		return nil, err
+	}
+	if offset < 0 {
+		return nil, errors.New("replication offset cannot be negative")
+	}
+	if offset < w.base {
+		return nil, fmt.Errorf("replication offset %d is below the durable prefix %d", offset, w.base)
+	}
+	entries, frameEnds, err := decodeFrames(data)
+	if err != nil {
+		return nil, fmt.Errorf("validate replicated WAL frames: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("replication frame body must not be empty")
+	}
+
+	if offset > w.totalSize {
+		return nil, fmt.Errorf("replication gap: follower ends at %d, stream starts at %d", w.totalSize, offset)
+	}
+	overlap := w.totalSize - offset
+	if overlap > int64(len(data)) {
+		overlap = int64(len(data))
+	}
+	if overlap > 0 {
+		existing := make([]byte, int(overlap))
+		if err := w.readLogicalAtLocked(offset, existing); err != nil {
+			return nil, fmt.Errorf("read existing WAL prefix: %w", err)
+		}
+		if !bytes.Equal(existing, data[:overlap]) {
+			return nil, errors.New("replicated WAL does not match follower prefix")
+		}
+	}
+
+	if overlap == int64(len(data)) {
+		return nil, nil
+	}
+	firstNewFrame := 0
+	for firstNewFrame < len(frameEnds) && frameEnds[firstNewFrame] <= int(overlap) {
+		firstNewFrame++
+	}
+	if firstNewFrame == len(frameEnds) || (overlap > 0 && (firstNewFrame == 0 || frameEnds[firstNewFrame-1] != int(overlap))) {
+		return nil, errors.New("replication overlap ends inside a WAL frame")
+	}
+	newEntries := entries[firstNewFrame:]
+	if validate != nil {
+		if err := validate(newEntries); err != nil {
+			return nil, fmt.Errorf("replicated entries are invalid: %w", err)
+		}
+	}
+
+	if err := w.appendFramesLocked(data[overlap:]); err != nil {
+		return nil, err
+	}
+	return newEntries, nil
 }
 
 func (w *WAL) Close() error {
