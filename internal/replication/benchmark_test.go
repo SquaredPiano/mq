@@ -42,6 +42,27 @@ func BenchmarkSynchronousPublishParallel(b *testing.B) {
 	b.ReportMetric(float64(stats.Groups)/float64(b.N), "syncs/op")
 }
 
+func BenchmarkSynchronousPublishParallelWindow(b *testing.B) {
+	for _, window := range []time.Duration{0, 50 * time.Microsecond, 200 * time.Microsecond, 500 * time.Microsecond} {
+		b.Run(window.String(), func(b *testing.B) {
+			leader := newBenchmarkPairWithWindow(b, window)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(replicationBenchmarkKey) + len(replicationBenchmarkValue)))
+			b.RunParallel(func(worker *testing.PB) {
+				for worker.Next() {
+					if _, err := leader.Publish("bench", replicationBenchmarkKey, replicationBenchmarkValue); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+			stats := leader.PublishGroupCommitStats()
+			b.ReportMetric(stats.FramesPerGroup(), "frames/sync")
+			b.ReportMetric(float64(stats.Groups)/float64(b.N), "syncs/op")
+		})
+	}
+}
+
 func newBenchmarkPair(b *testing.B) *broker.Broker {
 	return newBenchmarkPairWithWindow(b, broker.DefaultGroupCommitWindow)
 }
