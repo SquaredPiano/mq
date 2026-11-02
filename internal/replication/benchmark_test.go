@@ -63,6 +63,24 @@ func BenchmarkSynchronousPublishParallelWindow(b *testing.B) {
 	}
 }
 
+func BenchmarkSynchronousPublishBatch32(b *testing.B) {
+	leader := newBenchmarkPair(b)
+	const batchSize = 32
+	messages := make([]broker.Message, batchSize)
+	for i := range messages {
+		messages[i] = broker.Message{Key: replicationBenchmarkKey, Value: replicationBenchmarkValue}
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(batchSize * (len(replicationBenchmarkKey) + len(replicationBenchmarkValue))))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := leader.PublishBatch("bench", messages); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func newBenchmarkPair(b *testing.B) *broker.Broker {
 	return newBenchmarkPairWithWindow(b, broker.DefaultGroupCommitWindow)
 }
