@@ -133,6 +133,7 @@ type Broker struct {
 	snapshotSize       int64
 	epoch              uint64
 	replicate          func() error
+	propose            func([]wal.Entry) error
 	readOnly           bool
 	unavailable        error
 	closing            bool
@@ -772,6 +773,10 @@ func (b *Broker) Publish(topic string, key, value []byte) (uint64, error) {
 	return offsets[0], nil
 }
 
+func (b *Broker) SetPropose(fn func([]wal.Entry) error) {
+	b.propose = fn
+}
+
 func (b *Broker) PublishWithID(topic, requestID string, key, value []byte) (uint64, error) {
 	offsets, err := b.PublishBatchWithID(topic, requestID, []Message{{Key: key, Value: value}})
 	if err != nil {
@@ -891,6 +896,21 @@ func (b *Broker) publishBatchImmediate(topic, requestID string, messages []Messa
 			Value:     message.Value,
 			Timestamp: time.Now().UTC(),
 		}
+	}
+	if b.propose != nil {
+		kind := wal.BatchEntry
+		if requestID != "" {
+			kind = wal.IdempotentBatchEntry
+		}
+		if err := b.propose([]wal.Entry{{
+			Kind:      kind,
+			Topic:     topic,
+			RequestID: requestID,
+			Records:   records,
+		}}); err != nil {
+			return nil, err
+		}
+		return offsets, nil
 	}
 	if b.wal != nil {
 		var err error
@@ -1286,7 +1306,16 @@ func (b *Broker) Commit(group, topic string, nextOffset uint64) error {
 	if hasCommit && nextOffset < committed {
 		return fmt.Errorf("%w: current %d, requested %d", ErrCommitRegression, committed, nextOffset)
 	}
-	if b.wal != nil {
+	if b.propose != nil {
+		if err := b.propose([]wal.Entry{{
+			Kind:       wal.CommitEntry,
+			Group:      group,
+			Topic:      topic,
+			NextOffset: nextOffset,
+		}}); err != nil {
+			return err
+		}
+	} else if b.wal != nil {
 		if err := b.wal.AppendCommit(group, topic, nextOffset); err != nil {
 			return err
 		}
@@ -1330,7 +1359,15 @@ func (b *Broker) RetainFrom(topic string, startOffset uint64) error {
 	if startOffset > topicLog.EndOffset() {
 		return fmt.Errorf("%w: got %d, topic end is %d", ErrRetentionOutOfRange, startOffset, topicLog.EndOffset())
 	}
-	if startOffset > currentStart && b.wal != nil {
+	if b.propose != nil && startOffset > currentStart {
+		if err := b.propose([]wal.Entry{{
+			Kind:        wal.RetentionEntry,
+			Topic:       topic,
+			StartOffset: startOffset,
+		}}); err != nil {
+			return err
+		}
+	} else if startOffset > currentStart && b.wal != nil {
 		if err := b.wal.AppendRetention(topic, startOffset); err != nil {
 			if errors.Is(err, wal.ErrUnavailable) {
 				b.setUnavailableLocked(err)

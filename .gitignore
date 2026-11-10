@@ -7,3 +7,4 @@ follower-data/
 bench/*.bench
 bench/.venv/
 bench/values.json
+bench/cluster.bench

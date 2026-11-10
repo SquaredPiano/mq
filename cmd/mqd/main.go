@@ -17,6 +17,8 @@ import (
 
 	"mq/internal/broker"
 	"mq/internal/httpapi"
+	"mq/internal/mqcluster"
+	"mq/internal/raft"
 	"mq/internal/replication"
 )
 
@@ -48,6 +50,9 @@ func run() (runErr error) {
 	clientToken := flag.String("client-token", os.Getenv("MQ_CLIENT_TOKEN"), "Bearer token for public API routes; may also be set with MQ_CLIENT_TOKEN")
 	adminToken := flag.String("admin-token", os.Getenv("MQ_ADMIN_TOKEN"), "Bearer token for topic retention changes; may also be set with MQ_ADMIN_TOKEN")
 	leaderEpoch := flag.Uint64("epoch", 0, "positive, monotonically increasing leader epoch")
+	raftPeers := flag.String("raft-peers", "", "comma-separated HTTP base URLs of every raft node in cluster mode (self included, in order)")
+	raftSelf := flag.Int("raft-self", -1, "index into -raft-peers for this node in cluster mode")
+	raftToken := flag.String("raft-token", os.Getenv("MQ_RAFT_TOKEN"), "token for raft RPCs; may also be set with MQ_RAFT_TOKEN")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate PEM file; enables HTTPS")
 	tlsKey := flag.String("tls-key", "", "TLS private key PEM file; enables HTTPS")
 	flag.Parse()
@@ -85,6 +90,7 @@ func run() (runErr error) {
 
 	var handler http.Handler
 	var replicator *replication.Client
+	var cluster *mqcluster.Node
 	switch *role {
 	case "standalone":
 		if *replicaURL != "" || *replicationToken != "" || *leaderEpoch != 0 {
@@ -125,8 +131,35 @@ func run() (runErr error) {
 		if err != nil {
 			return err
 		}
+	case "cluster":
+		if *raftPeers == "" || *raftSelf < 0 || *raftToken == "" {
+			return errors.New("cluster role requires -raft-peers, -raft-self, and -raft-token")
+		}
+		urls := strings.Split(*raftPeers, ",")
+		if *raftSelf >= len(urls) {
+			return errors.New("-raft-self is outside -raft-peers")
+		}
+		var err error
+		cluster, err = mqcluster.Open(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond)
+		if err != nil {
+			return fmt.Errorf("open cluster node: %w", err)
+		}
+		defer func() {
+			if err := cluster.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close cluster: %w", err))
+			}
+			cluster = nil
+		}()
+		base, err := httpapi.NewAuthenticatedHandlerWithAdmin(cluster.Broker, *clientToken, *adminToken)
+		if err != nil {
+			return err
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/", base)
+		mux.Handle("/raft/", raft.HTTPHandler(cluster.Raft, *raftToken))
+		handler = mux
 	default:
-		return fmt.Errorf("unknown role %q (use standalone, leader, or follower)", *role)
+		return fmt.Errorf("unknown role %q (use standalone, leader, follower, or cluster)", *role)
 	}
 	if replicator != nil {
 		replicationWorkerDone = make(chan struct{})

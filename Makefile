@@ -5,12 +5,13 @@ PYTHON ?= python3
 test:
 	go vet ./... && go test -count=1 ./...
 
-bench/broker.bench bench/replication.bench:
+bench/broker.bench bench/replication.bench bench/cluster.bench:
 	mkdir -p bench
 	go test ./internal/broker -run '^$$' -bench 'Benchmark(PublishInMemory|PublishDurable|PublishParallelDurable$$|PublishBatchDurable|FetchBatch32$$)' -benchtime=500ms -count=1 > bench/broker.bench
 	go test ./internal/replication -run '^$$' -bench 'Benchmark(SynchronousPublish$$|SynchronousPublishParallel$$|SynchronousPublishBatch32|SynchronousPublishParallelWindow)' -benchtime=500ms -count=1 > bench/replication.bench
+	go test ./internal/mqcluster -run '^$$' -bench 'BenchmarkCluster' -benchtime=500ms -count=1 > bench/cluster.bench
 
-bench: bench/broker.bench bench/replication.bench
+bench: bench/broker.bench bench/replication.bench bench/cluster.bench
 
 chart: bench/broker.bench bench/replication.bench
 	@if [ -x bench/.venv/bin/python ]; then \
@@ -25,7 +26,7 @@ venv:
 	bench/.venv/bin/pip install -r bench/requirements.txt
 
 clean:
-	rm -f bench/broker.bench bench/replication.bench bench/values.json
+	rm -f bench/broker.bench bench/replication.bench bench/cluster.bench bench/values.json
 
 sec:
 	gosec -quiet -exclude=G115,G304 ./...

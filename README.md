@@ -174,6 +174,30 @@ internal/dirlock        one process per data directory
 docs                    retention notes and the benchmark chart
 ```
 
+## A three-node cluster
+
+Standalone and follower/leader roles run a single primary-backup pair. The `cluster` role runs three nodes with actual consensus: Raft election with majority acknowledgment, automatic promotion with no operator action required. A write is acknowledged only after a majority of the three nodes has committed it to their raft log.
+
+```sh
+export MQ_RAFT_TOKEN='replace-with-a-long-random-token'
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8081 -data ./cluster-1-data \
+  -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 0 -raft-token "$MQ_RAFT_TOKEN"
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8082 -data ./cluster-2-data \
+  -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 1 -raft-token "$MQ_RAFT_TOKEN"
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8083 -data ./cluster-3-data \
+  -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 2 -raft-token "$MQ_RAFT_TOKEN"
+```
+
+Pick any of the three HTTP ports as the client port. Ask every node for `/raft/role` to find the current leader; followers return 405 on client publishes.
+
+Membership is fixed at three nodes. There is no membership change yet, and no InstallSnapshot RPC: lagging followers replay from the leader's log. If a follower misses so much that the leader has nothing to send, remove and re-create the follower from a fresh directory.
+
+The trade is durability for latency. Every quorum-committed write costs a majority of disk flushes. On APFS (Apple M5, local disk, loopback HTTP), `BenchmarkClusterPublish` observes ~11 ms per publish (~85 publishes/s), versus ~4 ms for a single durable publish without a follower. Batching amortizes the quorum: `BenchmarkClusterPublishBatch32` acknowledges ~32 records per quorum sync. The cluster mode exists for safety, not for throughput; if throughput is the goal, the single-node groups with `-group-commit-window` are the right shape.
+
+## Limitations
+
+Limits: no membership change, no snapshot install for lagging followers, no quorum write path cheaper than three fsyncs on APFS.
+
 ## Benchmarks and Methodology
 
 ```sh
@@ -230,7 +254,7 @@ Requires Go 1.22+, macOS, Linux, or FreeBSD.
 
 ```sh
 make test     # go vet ./... && go test -count=1 ./...
-make bench    # writes bench/broker.bench and bench/replication.bench
+make bench    # writes bench/broker.bench, bench/replication.bench, bench/cluster.bench
 make chart    # re-renders docs/performance.png from the raw outputs
 make venv     # creates bench/.venv with matplotlib for chart rendering
 make sec      # gosec, excluding G115 and G304 which are bounds-checked false positives
@@ -256,7 +280,8 @@ Code carries no comments by design. All packages must pass `go vet`, `go test -c
 - Segment files are never deleted, so disk use grows with every acknowledged write.
 - Startup reads the whole log even when a snapshot supplies the broker state.
 - Request ids stay in memory until you throw the data directory away.
-- There is one configured leader and one follower. Failover is manual.
+- Failover is manual except in `cluster` mode, where Raft elects a new leader automatically.
+- Cluster membership is fixed; there is no Add/RemoveNode and there is no snapshot install RPC for a lagging follower.
 - A follower that is missing acknowledged frames must not be promoted.
 - After the first extra segment exists, a binary that reads only `wal.log` will miss the rest of the log.
 - Linux, macOS, and FreeBSD can take the directory lock. Other systems refuse to open a data directory.
