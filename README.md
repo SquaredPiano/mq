@@ -224,3 +224,27 @@ go test ./internal/replication -run '^$' \
    - Split-brain prevention: Two nodes cannot form a dynamic majority quorum (Raft/Paxos). Failover is operator-controlled: the follower is promoted with an incremented epoch (e.g., epoch 2). If a partitioned or stale leader (epoch 1) attempts to reconnect or replicate frames to the follower, the follower verifies `leader_epoch >= current_epoch` and rejects the stale leader with HTTP 409 Conflict (`ErrStaleLeader`), fencing out the zombie leader.
    - Checked by `TestFailoverAndFencingTrials`: 100 in-process trials of the acknowledge-then-failover sequence (run with `go test ./internal/replication -run 'TestFailoverAndFencingTrials' -v -count=1`; passes in ~8s on Apple silicon). Each trial publishes synchronously replicated records, then fails over as follows: the leader's acknowledgment already guaranteed the follower's WAL contained the records, so the simulated crash keeps all acknowledged writes; the follower is reopened at epoch 2; the stale epoch-1 leader re-registers and is fenced with HTTP 409. This is an in-process simulation, not an OS-process `kill -9`.
 
+## Reading that shaped the design
+
+- Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 3, "Storage and Retrieval". The write-ahead log is the durable history. The in-memory topic log is the set of records the broker can still serve.
+- Same book, chapter 5, "Replication". A client of this leader waits until both disks have the write. That is synchronous primary-backup replication.
+- Same book, chapter 11, "Stream Processing". Topics, offsets, and stored consumer positions are the log-based broker model. Delivery here is at least once.
+- Same book, chapter 9, "Consistency and Consensus". Election and quorums are left to the operator. The epoch fences one follower. It does not vote.
+- Jay Kreps, [The Log](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying). Readers keep their own position in an append-only log.
+- CRC32C in each frame uses the Castagnoli polynomial, the checksum family described for iSCSI in [RFC 3385](https://www.rfc-editor.org/rfc/rfc3385).
+- Group commit copies the PostgreSQL idea of letting concurrent commits share one flush. `-group-commit-window` is that collection wait.
+- Diego Ongaro and John Ousterhout, [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf). Raft is the background for a later quorum design. This repository does not implement Raft.
+
+## Limits you should know before you rely on it
+
+- Segment files are never deleted, so disk use grows with every acknowledged write.
+- Startup reads the whole log even when a snapshot supplies the broker state.
+- Request ids stay in memory until you throw the data directory away.
+- There is one configured leader and one follower. Failover is manual.
+- A follower that is missing acknowledged frames must not be promoted.
+- After the first extra segment exists, a binary that reads only `wal.log` will miss the rest of the log.
+- Linux, macOS, and FreeBSD can take the directory lock. Other systems refuse to open a data directory.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
