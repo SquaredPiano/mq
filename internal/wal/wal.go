@@ -286,13 +286,13 @@ type segmentPath struct {
 func (w *WAL) openReplaySegment(item segmentPath, start int64, isLast bool, checkpoint int64, apply func(Entry) error) (*walSegment, error) {
 	file, err := os.OpenFile(item.path, os.O_RDWR, 0o600)
 	if err != nil {
-		w.closeFiles()
+		_ = w.closeFiles()
 		return nil, fmt.Errorf("open WAL segment %q: %w", item.path, err)
 	}
 	info, err := file.Stat()
 	if err != nil {
 		closeErr := file.Close()
-		w.closeFiles()
+		_ = w.closeFiles()
 		return nil, errors.Join(fmt.Errorf("stat WAL segment %q: %w", item.path, err), closeErr)
 	}
 	segment := &walSegment{

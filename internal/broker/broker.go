@@ -92,7 +92,6 @@ type publishRequest struct {
 	walBytes  int64
 	done      chan publishResponse
 	offsets   []uint64
-	singleOff [1]uint64
 	alias     *publishRequest
 	err       error
 	accepted  bool

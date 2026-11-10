@@ -4,3 +4,6 @@ follower-data/
 *.test
 *.out
 .DS_Store
+bench/*.bench
+bench/.venv/
+bench/values.json

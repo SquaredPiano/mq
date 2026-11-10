@@ -196,20 +196,20 @@ go test ./internal/replication -run '^$' \
 
 | Path | Latency / Rate | Records / sec | Allocations |
 | --- | ---: | ---: | ---: |
-| Single durable write (1 sync/op) | 4.11 ms | 243 | 12 allocs/op |
-| Parallel durable group commit (~10 frames/sync) | 0.42 ms | 2,382 | 6 allocs/op |
-| Durable batch of 32 | 4.01 ms | 7,972 | 13 allocs/op |
+| Single durable write (1 sync/op) | 4.09 ms | 245 | 12 allocs/op |
+| Parallel durable group commit (~10 frames/sync) | 0.42 ms | 2,363 | 6 allocs/op |
+| Durable batch of 32 | 4.32 ms | 7,410 | 13 allocs/op |
 | Single synchronous replicated write | 8.04 ms | 124 | 114 allocs/op |
-| Synchronous replicated parallel group commit | 0.86 ms | 1,161 | 22 allocs/op |
-| Synchronous replicated batch of 32 | 8.16 ms | 3,921 | 125 allocs/op |
-| In-memory publish (no disk sync) | 162 ns | 6,177,000 | 3 allocs/op |
-| In-memory fetch of 32 records (3.6 GB/s) | 642 ns / batch | 49,844,000 | 2 allocs/op |
+| Synchronous replicated parallel group commit | 0.86 ms | 1,163 | 22 allocs/op |
+| Synchronous replicated batch of 32 | 8.18 ms | 3,913 | 125 allocs/op |
+| In-memory publish (no disk sync) | 161 ns | 6,227,000 | 3 allocs/op |
+| In-memory fetch of 32 records (2.6 GB/s) | 901 ns / batch | 35,516,000 | 2 allocs/op |
 
 ### Benchmark Provenance and Failure Model
 
-1. **Read Throughput Provenance (3.6 GB/s / 49.8M+ rec/s):**
+1. **Read Throughput Provenance (2.6 GB/s / 35.5M+ rec/s):**
    - The fetch benchmark (`BenchmarkFetchBatch32`) measures the in-memory record log engine (`internal/log`). It serves records directly from memory rather than disk or kernel page cache.
-   - Record size is 73 bytes (9-byte key + 64-byte value), read in batches of 32 records (2,336 bytes payload per batch) taking 642 ns per batch.
+   - Record size is 73 bytes (9-byte key + 64-byte value), read in batches of 32 records (2,336 bytes payload per batch) taking 901 ns per batch.
    - Performance is achieved by packing slice headers and contiguous record buffers in a single backing allocation, reducing heap allocations from 65 to 2 allocs/op (-97%).
 
 2. **Durable Disk Write Provenance (4.2ms → 0.43ms):**
@@ -223,6 +223,22 @@ go test ./internal/replication -run '^$' \
    - Network partition behavior: If the follower is unreachable, the leader cannot fulfill synchronous replication and rejects publishes with an error (HTTP 503). No unconfirmed writes are acknowledged as successful.
    - Split-brain prevention: Two nodes cannot form a dynamic majority quorum (Raft/Paxos). Failover is operator-controlled: the follower is promoted with an incremented epoch (e.g., epoch 2). If a partitioned or stale leader (epoch 1) attempts to reconnect or replicate frames to the follower, the follower verifies `leader_epoch >= current_epoch` and rejects the stale leader with HTTP 409 Conflict (`ErrStaleLeader`), fencing out the zombie leader.
    - Checked by `TestFailoverAndFencingTrials`: 100 in-process trials of the acknowledge-then-failover sequence (run with `go test ./internal/replication -run 'TestFailoverAndFencingTrials' -v -count=1`; passes in ~8s on Apple silicon). Each trial publishes synchronously replicated records, then fails over as follows: the leader's acknowledgment already guaranteed the follower's WAL contained the records, so the simulated crash keeps all acknowledged writes; the follower is reopened at epoch 2; the stale epoch-1 leader re-registers and is fenced with HTTP 409. This is an in-process simulation, not an OS-process `kill -9`.
+
+## Developing
+
+Requires Go 1.22+, macOS, Linux, or FreeBSD.
+
+```sh
+make test     # go vet ./... && go test -count=1 ./...
+make bench    # writes bench/broker.bench and bench/replication.bench
+make chart    # re-renders docs/performance.png from the raw outputs
+make venv     # creates bench/.venv with matplotlib for chart rendering
+make sec      # gosec, excluding G115 and G304 which are bounds-checked false positives
+```
+
+The `.bench` outputs are gitignored. Chart generation needs matplotlib (`make venv` once, or any python with matplotlib installed).
+
+Code carries no comments by design. All packages must pass `go vet`, `go test -count=1 ./...`, `staticcheck ./...`, and `gosec ./...`.
 
 ## Reading that shaped the design
 
