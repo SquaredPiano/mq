@@ -169,7 +169,9 @@ Segment deletion is still ahead. Both nodes need the same snapshot generation, c
 cmd/mqd                 the mqd process
 internal/log            topic log and the retained start offset
 internal/wal            segmented write-ahead log
-internal/broker         topics, groups, request ids, snapshots
+internal/broker         topics, groups, request ids, snapshots, raft FSM
+internal/mqcluster      cluster wiring for the mqd binary and tests
+internal/raft           Raft election, log storage, InstallSnapshot RPC
 internal/httpapi        HTTP routes
 internal/replication    leader to follower transfer
 internal/dirlock        one process per data directory
@@ -208,7 +210,7 @@ The trade is durability for latency. Every quorum-committed write costs a majori
 
 ## Limitations
 
-Limits: no membership change, no snapshot install for lagging followers, no quorum write path cheaper than three fsyncs on APFS.
+Limits: no membership change, no cluster snapshot restore from in-memory torn-bit failure (install only works on whole FSM replacement — partially tested), quorum write path cheaper than three fsyncs on APFS not available yet. The 3-node Raft install snapshot RPC is implemented and healthy, and followers can catch up from a snapshot if they fall behind enough that the raft log no longer has their prefix.
 
 ## Benchmarks and Methodology
 
