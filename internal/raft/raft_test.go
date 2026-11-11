@@ -316,3 +316,21 @@ func TestSnapshotSurvivesLeaderLoss(t *testing.T) {
 		_ = snapIdx
 	}
 }
+
+func TestSingleNodeClusterPublishesThroughRaft(t *testing.T) {
+	nodes := newCluster(t, 1)
+	tickClusterN(t, nodes, 30)
+	if nodes[0].StateRole() != Leader {
+		t.Fatalf("single-node cluster never reached Leader; role = %d", nodes[0].StateRole())
+	}
+	target, err := nodes[0].Propose([]byte("frame"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target == 0 {
+		t.Fatalf("target = 0, want positive index")
+	}
+	if n := nodes[0].CommitIndex(); n == 0 {
+		t.Fatalf("commit index = 0, want at least 1")
+	}
+}
