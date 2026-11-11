@@ -177,3 +177,44 @@ func TestLaggingFollowerCatchesUp(t *testing.T) {
 		}
 	}
 }
+
+func TestCommittedEntrySurvivesLeaderLoss(t *testing.T) {
+	nodes := newCluster(t, 3)
+	tickClusterN(t, nodes, 30)
+	leader := findsLeader(nodes)
+	if leader == -1 {
+		t.Fatal("no leader")
+	}
+	if _, err := nodes[leader].Propose([]byte("entry-a")); err != nil {
+		t.Fatal(err)
+	}
+	nodes[leader].Close()
+	surviving := make([]*Node, 0, 2)
+	for i, node := range nodes {
+		if i == leader {
+			continue
+		}
+		surviving = append(surviving, node)
+	}
+	time.Sleep(10 * time.Millisecond)
+	for round := 0; round < 50; round++ {
+		for _, node := range surviving {
+			node.Tick()
+		}
+	}
+	leader2 := -1
+	for i, node := range nodes {
+		if i == leader {
+			continue
+		}
+		if node.StateRole() == Leader {
+			leader2 = i
+		}
+	}
+	if leader2 == -1 {
+		t.Fatal("no replacement leader emerged")
+	}
+	if got := nodes[leader2].CommitIndex(); got < 1 {
+		t.Fatalf("new leader commit index = %d, want at least 1", got)
+	}
+}

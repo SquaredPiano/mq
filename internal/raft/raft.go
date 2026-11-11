@@ -86,6 +86,7 @@ type Node struct {
 	cfg     Config
 	peers   []Peer
 	fsm     FSM
+	started bool
 	storage Storage
 
 	mu          sync.Mutex
@@ -162,6 +163,12 @@ func New(cfg Config, peers []Peer, fsm FSM) (*Node, error) {
 }
 
 func (n *Node) Start() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.started {
+		return nil
+	}
+	n.started = true
 	go n.run()
 	return nil
 }
@@ -183,8 +190,13 @@ func (n *Node) run() {
 
 func (n *Node) Close() {
 	n.stopOnce.Do(func() {
-		close(n.stop)
-		<-n.done
+		n.mu.Lock()
+		started := n.started
+		n.mu.Unlock()
+		if started {
+			close(n.stop)
+			<-n.done
+		}
 		n.mu.Lock()
 		_ = n.storage.Close()
 		n.mu.Unlock()
