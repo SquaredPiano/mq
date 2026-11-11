@@ -8,4 +8,4 @@ bench/*.bench
 bench/.venv/
 bench/values.json
 bench/cluster.bench
-mqd
+/bin/
