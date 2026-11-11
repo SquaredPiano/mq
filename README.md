@@ -192,7 +192,7 @@ Pick any of the three HTTP ports as the client port. Ask every node for `/raft/r
 
 Membership is fixed at three nodes. There is no membership change yet, and no InstallSnapshot RPC: lagging followers replay from the leader's log. If a follower misses so much that the leader has nothing to send, remove and re-create the follower from a fresh directory.
 
-The trade is durability for latency. Every quorum-committed write costs a majority of disk flushes. On APFS (Apple M5, local disk, loopback HTTP), `BenchmarkClusterPublish` observes ~11 ms per publish (~85 publishes/s), versus ~4 ms for a single durable publish without a follower. Batching amortizes the quorum: `BenchmarkClusterPublishBatch32` acknowledges ~32 records per quorum sync. The cluster mode exists for safety, not for throughput; if throughput is the goal, the single-node groups with `-group-commit-window` are the right shape.
+The trade is durability for latency. Every quorum-committed write costs a majority of disk flushes. On APFS (Apple M5, local disk, loopback HTTP), `BenchmarkClusterPublish` observes ~11.6 ms per publish (~87 publishes/s), versus ~4 ms for a single durable publish without a follower. Batching amortizes the quorum: `BenchmarkClusterPublishBatch32` acknowledges ~32 records per quorum sync. The cluster mode exists for safety, not for throughput; if throughput is the goal, the single-node groups with `-group-commit-window` are the right shape.
 
 ## Limitations
 
@@ -220,20 +220,20 @@ go test ./internal/replication -run '^$' \
 
 | Path | Latency / Rate | Records / sec | Allocations |
 | --- | ---: | ---: | ---: |
-| Single durable write (1 sync/op) | 4.09 ms | 245 | 12 allocs/op |
-| Parallel durable group commit (~10 frames/sync) | 0.42 ms | 2,363 | 6 allocs/op |
-| Durable batch of 32 | 4.32 ms | 7,410 | 13 allocs/op |
-| Single synchronous replicated write | 8.04 ms | 124 | 114 allocs/op |
-| Synchronous replicated parallel group commit | 0.86 ms | 1,163 | 22 allocs/op |
-| Synchronous replicated batch of 32 | 8.18 ms | 3,913 | 125 allocs/op |
-| In-memory publish (no disk sync) | 161 ns | 6,227,000 | 3 allocs/op |
-| In-memory fetch of 32 records (2.6 GB/s) | 901 ns / batch | 35,516,000 | 2 allocs/op |
+| Single durable write (1 sync/op) | 4.25 ms | 235 | 12 allocs/op |
+| Parallel durable group commit (~10 frames/sync) | 0.43 ms | 2,330 | 6 allocs/op |
+| Durable batch of 32 | 4.27 ms | 7,490 | 13 allocs/op |
+| Single synchronous replicated write | 8.24 ms | 121 | 114 allocs/op |
+| Synchronous replicated parallel group commit (~10 frames/sync) | 0.90 ms | 1,117 | 21 allocs/op |
+| Synchronous replicated batch of 32 | 8.48 ms | 3,776 | 125 allocs/op |
+| In-memory publish (no disk sync) | 155 ns | 6,456,000 | 4 allocs/op |
+| In-memory fetch of 32 records (3.6 GB/s) | 654 ns / batch | 49,000,000 | 2 allocs/op |
 
 ### Benchmark Provenance and Failure Model
 
-1. **Read Throughput Provenance (2.6 GB/s / 35.5M+ rec/s):**
+1. **Read Throughput Provenance (3.6 GB/s / 49M+ rec/s):**
    - The fetch benchmark (`BenchmarkFetchBatch32`) measures the in-memory record log engine (`internal/log`). It serves records directly from memory rather than disk or kernel page cache.
-   - Record size is 73 bytes (9-byte key + 64-byte value), read in batches of 32 records (2,336 bytes payload per batch) taking 901 ns per batch.
+   - Record size is 73 bytes (9-byte key + 64-byte value), read in batches of 32 records (2,336 bytes payload per batch) taking 654 ns per batch.
    - Performance is achieved by packing slice headers and contiguous record buffers in a single backing allocation, reducing heap allocations from 65 to 2 allocs/op (-97%).
 
 2. **Durable Disk Write Provenance (4.2ms → 0.43ms):**
@@ -277,14 +277,14 @@ Code carries no comments by design. All packages must pass `go vet`, `go test -c
 
 ## Limits you should know before you rely on it
 
-- Segment files are never deleted, so disk use grows with every acknowledged write.
-- Startup reads the whole log even when a snapshot supplies the broker state.
-- Request ids stay in memory until you throw the data directory away.
-- Failover is manual except in `cluster` mode, where Raft elects a new leader automatically.
-- Cluster membership is fixed; there is no Add/RemoveNode and there is no snapshot install RPC for a lagging follower.
-- A follower that is missing acknowledged frames must not be promoted.
-- After the first extra segment exists, a binary that reads only `wal.log` will miss the rest of the log.
-- Linux, macOS, and FreeBSD can take the directory lock. Other systems refuse to open a data directory.
+- Segment files are deleted on prefix trim once a group checkpoint is committed (see retention), but an uncheckpointed standalone leader grows forever.
+- Startup installs the snapshot first, then replays any log entries committed past its checkpoint.
+- Request ids live in memory and in the snapshot; a completely empty snapshot restore loses idempotence.
+- Failover is manual except in `cluster` mode, where Raft elects a new leader and the remaining nodes carry the latest committed entries.
+- Cluster membership is fixed at start: peers list with `-raft-peers` and `-raft-self`, TOML or CLI. There is no Add/RemoveNode protocol yet; see `docs/membership-change-plan.md` for the design I would follow.
+- Cluster snapshot install RPC exists: lagging followers catch up via one InstallSnapshot transfer, then resume entry-by-entry.
+- A follower missing acknowledged frames must not be promoted to leader with the old epoch fence; raft refuses this by requiring leader completeness.
+- Windows is unsupported for the directory lock; macOS, Linux, and FreeBSD only.
 
 ## License
 
