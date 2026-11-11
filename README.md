@@ -7,12 +7,6 @@ It speaks HTTP and JSON. It is not Kafka. It does what this README describes and
 ## Run it
 
 ```sh
-mq run -listen 127.0.0.1:8080
-```
-
-Or, from source:
-
-```sh
 go run ./cmd/mqd -listen 127.0.0.1:8080
 ```
 
@@ -43,25 +37,25 @@ Consumer groups track their own offsets. If the process dies before a commit lan
 Standalone:
 
 ```sh
-mq run -listen 127.0.0.1:8080
+go run ./cmd/mqd -listen 127.0.0.1:8080
 ```
 
 Primary-backup replication (follower first):
 
 ```sh
-mq run -role follower -listen 127.0.0.1:8081 -data ./follower-data -replication-token 'replace-with-a-long-random-token'
-mq run -role leader -listen 127.0.0.1:8080 -data ./leader-data -replica http://127.0.0.1:8081 -replication-token 'replace-with-a-long-random-token' -epoch 1
+go run ./cmd/mqd -role follower -listen 127.0.0.1:8081 -data ./follower-data -replication-token 'replace-with-a-long-random-token'
+go run ./cmd/mqd -role leader -listen 127.0.0.1:8080 -data ./leader-data -replica http://127.0.0.1:8081 -replication-token 'replace-with-a-long-random-token' -epoch 1
 ```
 
 Three-node Raft cluster (any odd number of nodes works):
 
 ```sh
 export MQ_RAFT_TOKEN='replace-with-a-long-random-token'
-mq run -role cluster -listen 127.0.0.1:8081 -data ./node-1-data \
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8081 -data ./node-1-data \
   -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 0 -raft-token "$MQ_RAFT_TOKEN"
-mq run -role cluster -listen 127.0.0.1:8082 -data ./node-2-data \
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8082 -data ./node-2-data \
   -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 1 -raft-token "$MQ_RAFT_TOKEN"
-mq run -role cluster -listen 127.0.0.1:8083 -data ./node-3-data \
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8083 -data ./node-3-data \
   -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 2 -raft-token "$MQ_RAFT_TOKEN"
 ```
 
