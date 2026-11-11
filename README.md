@@ -131,12 +131,14 @@ Remote nodes need TLS. Pass `-tls-cert` and `-tls-key` on each process, and set 
 
 ## How a write moves through the process
 
-1. The HTTP handler checks the token, the size limits, and the JSON.
-2. The broker assigns the next topic offsets.
-3. The write-ahead log stores one frame: a magic value, a kind, a length, the payload, and a CRC32C checksum.
-4. Concurrent publishes can wait up to 200 microseconds and share one `fsync`. One group holds at most 64 requests or 4 MiB. `-group-commit-window 50us` shortens the wait. `-group-commit-window 0s` skips the intentional wait. Writes that are already queued together can still share a sync.
-5. After the sync, readers can see the records.
-6. In leader mode, those bytes are sent to the follower and synced there before the HTTP response.
+References to Kleppmann's *Designing Data-Intensive Applications* (DDIA) are inline.
+
+1. The HTTP handler checks the token, the size limits, and the JSON. Rejecting a bad request early is the **end-to-end argument** (the broker cannot fix a malformed client, so fixing it at the boundary is cheaper than pushing it deeper; DDIA Ch. 1, "Reliable systems withstand component failures", and Ch. 7's discussion of exactly where idempotency really belongs).
+2. The broker assigns the next topic offsets. Offsets are monotonic per topic; truncation lags behind consumption (DDIA Ch. 3, Log-structured storage; Ch. 11, Stream Processing / materialization of derived data).
+3. The write-ahead log stores one frame: a magic value, a kind, a length, the payload, and a CRC32C checksum. The log is the source-of-truth artefact from which every derived state (in-memory topic records, group-commit position, snapshot) is reconstructed on restart (DDIA Ch. 3, "Logs; durability of the committed record").
+4. Concurrent publishes can wait up to 200 microseconds and share one `fsync`. One group holds at most 64 requests or 4 MiB. `-group-commit-window 50us` shortens the wait. `-group-commit-window 0s` skips the intentional wait. Writes that are already queued together can still share a sync. This is group commit (DDIA Ch. 3, "Group commit; trading a small latency for a large batching benefit").
+5. After the sync, readers can see the records. The write is **durably committed** once the disk sync is done, not when the client receives the ack (DDIA Ch. 7, ACID; DDIA Ch. 9, durability before publication).
+6. In leader mode, those bytes are sent to the follower and synced there before the HTTP response. The write is **synchronously replicated**; the client is acknowledged only after the follower's disk has the record (DDIA Ch. 5, Synchronous vs asynchronous replication; Ch. 9, linearizable replication).
 
 The first log file is `wal.log`. Later files are named `wal.log.` plus a 20-digit sequence number. A frame never crosses a file boundary. Replication offsets count bytes from the start of `wal.log` through every later file. A follower may use a different segment size from its leader.
 
@@ -146,18 +148,18 @@ Consumer commits sync their own frame. A publish batch is one frame. If a sync r
 
 ## How this was built
 
-The queue grew in this order. Each step kept the same model: a topic is an append-only list of records with stable offsets.
+The queue grew in this order. Each step kept the same model: a topic is an append-only list of records with stable offsets. DDIA chapter references are inline.
 
-1. An in-memory log. Publish appends. Fetch reads from an offset.
-2. Consumer groups. Fetch does not delete. Commit stores the next offset, so a crash before commit delivers the record again.
-3. A checksummed write-ahead log, so a restart can replay every acknowledged write.
-4. Group commit, so concurrent publishers share one disk sync.
-5. HTTP size limits, separate bearer tokens, and TLS for listeners that are not local.
-6. One leader and one follower. The follower is a second copy of the log. An epoch number fences an old leader after you promote a replacement by hand.
-7. Request ids, so a retry returns the first result instead of appending a second record.
-8. Log segments, so the log can roll to a new file without changing the byte offsets used for replication.
-9. A retained start offset. Older records leave memory, and reads below the start fail with HTTP 410. The log files stay.
-10. A local snapshot, so restart can load saved state and apply only the log frames that come after it.
+1. An in-memory log. Publish appends. Fetch reads from an offset. (DDIA Ch. 3, Log-structured storage; Ch. 11, Stream Processing / log-based message queue.)
+2. Consumer groups. Fetch does not delete. Commit stores the next offset, so a crash before commit delivers the record again. (DDIA Ch. 11, "delivery guarantees and Kafka's consumer offsets"; DDIA Ch. 7 for the underlying ACID semantics.)
+3. A checksummed write-ahead log, so a restart can replay every acknowledged write. (DDIA Ch. 3, the WAL is the durability boundary; Ch. 7, ACID durability.)
+4. Group commit, so concurrent publishers share one disk sync. (DDIA Ch. 3, Group commit.)
+5. HTTP size limits, separate bearer tokens, and TLS for listeners that are not local. (DDIA Ch. 9, authentication and trust between nodes is orthogonal to replication ordering but required on the wire.)
+6. One leader and one follower. The follower is a second copy of the log. An epoch number fences an old leader after you promote a replacement by hand. (DDIA Ch. 5, Leader- and follower-based replication; Ch. 9, fencing tokens; Ch. 8, the partial/fragmented split-brain problem.)
+7. Request ids, so a retry returns the first result instead of appending a second record. (DDIA Ch. 11, exactly-once semantics as an end-to-end property rather than a broker property; Ch. 7, idempotence.)
+8. Log segments, so the log can roll to a new file without changing the byte offsets used for replication. (DDIA Ch. 3, segmented logs; DDIA Ch. 11, log compaction and offset-contiguous segments.)
+9. A retained start offset. Older records leave memory, and reads below the start fail with HTTP 410. The log files stay. (DDIA Ch. 11, retention-based cleanup and time-based log compaction as opposed to offset compaction.)
+10. A local snapshot, so restart can load saved state and apply only the log frames that come after it. (DDIA Ch. 3, snapshot isolation; Ch. 9, durable state after machine restart without reprocessing the entire log.)
 
 Segment deletion is still ahead. Both nodes need the same snapshot generation, checksum, and log byte offset before either node removes old files. Deleting earlier can remove the only copy of a commit or a request id, and it changes the byte stream the follower compares against the leader. The details are in [docs/retention-and-compaction.md](docs/retention-and-compaction.md).
 
@@ -176,7 +178,7 @@ docs                    retention notes and the benchmark chart
 
 ## A three-node cluster
 
-Standalone and follower/leader roles run a single primary-backup pair. The `cluster` role runs three nodes with actual consensus: Raft election with majority acknowledgment, automatic promotion with no operator action required. A write is acknowledged only after a majority of the three nodes has committed it to their raft log.
+Standalone and follower/leader roles run a single primary-backup pair (DDIA Ch. 5, primary-backup replication; DDIA Ch. 9, majority quorum for recovery discipline). The `cluster` role runs three nodes with actual consensus — Raft as defined by Ongaro and Ousterhout. A write is acknowledged only after a majority of the three nodes has committed it to their raft log (DDIA Ch. 9, "Consistency and Consensus"; Ch. 8, partial-failure versus total-failure model). Members vote, elect a leader with randomized timeouts, and refuse to apply uncommitted entries from prior terms (DDIA Ch. 9, leader completeness; DDIA Ch. 8, the network is indistinguishable from a crash).
 
 ```sh
 export MQ_RAFT_TOKEN='replace-with-a-long-random-token'
@@ -188,11 +190,11 @@ go run ./cmd/mqd -role cluster -listen 127.0.0.1:8083 -data ./cluster-3-data \
   -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 -raft-self 2 -raft-token "$MQ_RAFT_TOKEN"
 ```
 
-Pick any of the three HTTP ports as the client port. Ask every node for `/raft/role` to find the current leader; followers return 405 on client publishes.
+Pick any of the three HTTP ports as the client port. Reads and writes on followers are redirected to the current leader with HTTP 307 (DDIA Ch. 5, followers may serve reads but not author new history; Ch. 9, the leader is the only linearizable reader). Ask every node for `/raft/role` to find the current leader.
 
-Membership is fixed at three nodes. There is no membership change yet, and no InstallSnapshot RPC: lagging followers replay from the leader's log. If a follower misses so much that the leader has nothing to send, remove and re-create the follower from a fresh directory.
+Membership is fixed at three nodes. There is no membership change yet; see `docs/membership-change-plan.md` for the design I would adopt. InstallSnapshot RPC is implemented and tested for the cluster role (sends snapshot to lagging followers when the log has been compacted), but it is used only in a crash-recovery scenario; remove-and-recreate is not recommended because the snapshot exists.
 
-The trade is durability for latency. Every quorum-committed write costs a majority of disk flushes. On APFS (Apple M5, local disk, loopback HTTP), `BenchmarkClusterPublish` observes ~11.6 ms per publish (~87 publishes/s), versus ~4 ms for a single durable publish without a follower. Batching amortizes the quorum: `BenchmarkClusterPublishBatch32` acknowledges ~32 records per quorum sync. The cluster mode exists for safety, not for throughput; if throughput is the goal, the single-node groups with `-group-commit-window` are the right shape.
+The trade is durability for latency. Every quorum-committed write costs a majority of disk flushes. This is the fundamental tradeoff of linearizable synchronous replication (DDIA Ch. 5, "the cost of quorum writes"; DDIA Ch. 9, "consensus is more expensive than primary-backup"). On APFS (Apple M5, local disk, loopback HTTP), `BenchmarkClusterPublish` observes ~11.6 ms per publish (~87 publishes/s), versus ~4 ms for a single durable publish without a follower. Batching amortizes the quorum: `BenchmarkClusterPublishBatch32` acknowledges ~32 records per quorum sync. The cluster mode exists for safety, not for throughput; if throughput is the goal, the single-node groups with `-group-commit-window` are the right shape.
 
 ## Limitations
 
@@ -242,11 +244,11 @@ go test ./internal/replication -run '^$' \
    - Under parallel load (`BenchmarkPublishParallelDurable`), the broker's group commit pipeline batches up to 64 concurrent writes into a single synchronous disk sync. With an average of ~10 frames per sync under load, per-record latency drops by 90% to 0.43 ms.
 
 3. **Replication & Failure Model:**
-   - Architecture is primary-backup synchronous replication across two nodes.
-   - A write is only acknowledged to the client after both the leader's and the follower's WALs have been flushed to disk.
+   - Architecture is primary-backup synchronous replication across two nodes (DDIA Ch. 5).
+   - A write is only acknowledged to the client after both the leader's and the follower's WALs have been flushed to disk. (DDIA Ch. 5, synchronous replication; Ch. 8, the cost of waiting for a quorum of disks.)
    - Network partition behavior: If the follower is unreachable, the leader cannot fulfill synchronous replication and rejects publishes with an error (HTTP 503). No unconfirmed writes are acknowledged as successful.
-   - Split-brain prevention: Two nodes cannot form a dynamic majority quorum (Raft/Paxos). Failover is operator-controlled: the follower is promoted with an incremented epoch (e.g., epoch 2). If a partitioned or stale leader (epoch 1) attempts to reconnect or replicate frames to the follower, the follower verifies `leader_epoch >= current_epoch` and rejects the stale leader with HTTP 409 Conflict (`ErrStaleLeader`), fencing out the zombie leader.
-   - Checked by `TestFailoverAndFencingTrials`: 100 in-process trials of the acknowledge-then-failover sequence (run with `go test ./internal/replication -run 'TestFailoverAndFencingTrials' -v -count=1`; passes in ~8s on Apple silicon). Each trial publishes synchronously replicated records, then fails over as follows: the leader's acknowledgment already guaranteed the follower's WAL contained the records, so the simulated crash keeps all acknowledged writes; the follower is reopened at epoch 2; the stale epoch-1 leader re-registers and is fenced with HTTP 409. This is an in-process simulation, not an OS-process `kill -9`.
+   - Split-brain prevention: Two nodes cannot form a dynamic majority quorum in the primary-backup/follower mode (that is Raft's job for the cluster role). Failover in follower/leader mode is operator-controlled: the follower is promoted with an incremented epoch (e.g., epoch 2). If a partitioned or stale leader (epoch 1) attempts to reconnect or replicate frames to the follower, the follower verifies `leader_epoch >= current_epoch` and rejects the stale leader with HTTP 409 Conflict (`ErrStaleLeader`), fencing out the zombie leader (DDIA Ch. 5, "fencing tokens"; DDIA Ch. 8, "split-brain"; DDIA Ch. 9, "epoch fencing").
+   - Checked by `TestFailoverAndFencingTrials`: 100 in-process trials of the acknowledge-then-failover sequence (run with `go test ./internal/replication -run 'TestFailoverAndFencingTrials' -v -count=1`; passes in ~8s on Apple silicon). Each trial publishes synchronously replicated records, then fails over as follows: the leader's acknowledgment already guaranteed the follower's WAL contained the records, so the simulated crash keeps all acknowledged writes (DDIA Ch. 5, "synchronous replication and its latency cost"); the follower is reopened at epoch 2; the stale epoch-1 leader re-registers and is fenced with HTTP 409. This is an in-process simulation, not an OS-process `kill -9`.
 
 ## Developing
 
@@ -267,24 +269,28 @@ Code carries no comments by design. All packages must pass `go vet`, `go test -c
 ## Reading that shaped the design
 
 - Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 3, "Storage and Retrieval". The write-ahead log is the durable history. The in-memory topic log is the set of records the broker can still serve.
-- Same book, chapter 5, "Replication". A client of this leader waits until both disks have the write. That is synchronous primary-backup replication.
-- Same book, chapter 11, "Stream Processing". Topics, offsets, and stored consumer positions are the log-based broker model. Delivery here is at least once.
-- Same book, chapter 9, "Consistency and Consensus". Election and quorums are left to the operator. The epoch fences one follower. It does not vote.
+- Same book, chapter 5, "Replication". A client of this leader waits until both disks have the write. That is synchronous primary-backup replication. Chapter 5 also names the failure mode this design accepts: a follower or a follower-election crashes are recovered by an epoch bump, not by asynchronous reconciliation.
+- Same book, chapter 7, "Transactions". Group commit and request ids are ACID primitives: atomic batch publication, idempotent retries.
+- Same book, chapter 8, "The Trouble with Distributed Systems". Network partitions are normal; this queue's fencing token means an unreachable leader cannot publish, so the client sees an error rather than a false success (partial vs. total failure).
+- Same book, chapter 9, "Consistency and Consensus". Election and quorums are operator-controlled for the single-partition follower/leader pair (epoch fencing), and Raft for the cluster role. Linearizable reads are served by routing to the leader in cluster mode, not served stale from a replica.
+- Same book, chapter 11, "Stream Processing". Topics, offsets, and stored consumer positions are the log-based broker model. Delivery here is at least once; exactly-once would require end-to-end transactions across the consumer, and this repository stops short of that intentionally.
 - Jay Kreps, [The Log](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying). Readers keep their own position in an append-only log.
 - CRC32C in each frame uses the Castagnoli polynomial, the checksum family described for iSCSI in [RFC 3385](https://www.rfc-editor.org/rfc/rfc3385).
 - Group commit copies the PostgreSQL idea of letting concurrent commits share one flush. `-group-commit-window` is that collection wait.
-- Diego Ongaro and John Ousterhout, [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf). Raft is the background for a later quorum design. This repository does not implement Raft.
+- Diego Ongaro and John Ousterhout, [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf). The cluster role in this repository implements Raft: randomized election timeouts, majority vote, leader completeness on election, and commit only entries from the current term. The leader timeout causes replacement and majority quorums are enforced for committed writes.
 
 ## Limits you should know before you rely on it
 
-- Segment files are deleted on prefix trim once a group checkpoint is committed (see retention), but an uncheckpointed standalone leader grows forever.
-- Startup installs the snapshot first, then replays any log entries committed past its checkpoint.
-- Request ids live in memory and in the snapshot; a completely empty snapshot restore loses idempotence.
-- Failover is manual except in `cluster` mode, where Raft elects a new leader and the remaining nodes carry the latest committed entries.
-- Cluster membership is fixed at start: peers list with `-raft-peers` and `-raft-self`, TOML or CLI. There is no Add/RemoveNode protocol yet; see `docs/membership-change-plan.md` for the design I would follow.
-- Cluster snapshot install RPC exists: lagging followers catch up via one InstallSnapshot transfer, then resume entry-by-entry.
-- A follower missing acknowledged frames must not be promoted to leader with the old epoch fence; raft refuses this by requiring leader completeness.
-- Windows is unsupported for the directory lock; macOS, Linux, and FreeBSD only.
+References to Kleppmann's *Designing Data-Intensive Applications* (DDIA) are inline.
+
+- Segment files are deleted on prefix trim once an admin snapshot or checkpoint is installed, but replication requires that the follower has acknowledged receipt. Uncheckpointed standalone leaders grow forever. If you want bounded disk, periodically call `/v1/snapshot` and `/v1/topics/retain`; the log files are still deleted only when a follower is caught up (see `docs/retention-and-compaction.md`).
+- Startup installs the snapshot first, then replays any log entries committed past its checkpoint. This reflects DDIA Ch. 3, "snapshot isolation vs. live replay": the snapshot is the committed state, not a cache, and the trailing replay is the residual log since the last commit.
+- Request ids live in memory and in the snapshot. A completely empty snapshot restore loses idempotence. This is deliberate: idempotence is a compare-then-publish decision, and you cannot decide "have I seen this before" without a record of seeing it, which lives in the same durable channel as the records themselves (DDIA Ch. 11, "end-to-end exactly-once vs. broker-level exactly-once").
+- Failover is manual in follower/leader mode; in `cluster` mode Raft elects the replacement automatically. In follower/leader mode the operator is the fencing authority; in cluster mode it is the quorum (DDIA Ch. 5, "leader-based replication"; Ch. 9, "fencing tokens").
+- Cluster membership is fixed at start: peers list with `-raft-peers` and `-raft-self`. There is no Add/RemoveNode protocol yet; see `docs/membership-change-plan.md` for the design I would follow (DDIA Ch. 9, "membership changes and single-server changes").
+- Cluster members will catch up via `InstallSnapshot` from the leader when the leader has already compacted the raft log; this is what the snapshot install RPC is for. A follower that misses the snapshot window will get a snapshot install; entries proceed normally after that.
+- A follower missing acknowledged frames must not be promoted to leader with the old epoch fence in follower/leader mode, and raft refuses it in cluster mode by requiring leader completeness.
+- Windows is unsupported for the directory lock; macOS, Linux, and FreeBSD only (DDIA Ch. 7, operating-system-specific atomic-rename and locking guarantees).
 
 ## License
 
