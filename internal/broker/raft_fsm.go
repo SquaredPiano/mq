@@ -15,6 +15,9 @@ func NewRaftFSM(b *Broker) *RaftFSM {
 }
 
 func (r *RaftFSM) Apply(command []byte) error {
+	if len(command) == 0 {
+		return nil
+	}
 	var entries []wal.Entry
 	if err := json.Unmarshal(command, &entries); err != nil {
 		return err

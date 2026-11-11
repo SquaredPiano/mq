@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"mq/internal/broker"
@@ -28,11 +31,31 @@ func Open(dir string, peers []string, selfIndex int, raftToken string, heartbeat
 		return nil, errors.New("raft token must not be empty")
 	}
 	cfg := raft.Config{
-		Self:      selfIndex,
-		Tick:      heartbeat,
-		HeartbeatTicks: 1,
+		Self:             selfIndex,
+		Tick:             heartbeat,
+		HeartbeatTicks:   1,
 		ElectionMinTicks: 10,
 		ElectionMaxTicks: 20,
+	}
+	for i, peerURL := range peers {
+		parsed, err := url.Parse(peerURL)
+		if err != nil {
+			return nil, fmt.Errorf("raft peer %d has invalid URL %q: %w", i, peerURL, err)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return nil, fmt.Errorf("raft peer %d URL must use http or https, got %q", i, peerURL)
+		}
+		if parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, fmt.Errorf("raft peer %d URL %q must not contain user info, query, or fragment", i, peerURL)
+		}
+		if parsed.Scheme == "http" && !isLoopback(parsed.Hostname()) {
+			return nil, fmt.Errorf("raft peer %d over plain HTTP is only allowed to loopback, got %q", i, peerURL)
+		}
+		for j := 0; j < i; j++ {
+			if peers[j] == peerURL {
+				return nil, fmt.Errorf("raft peer %d is a duplicate of peer %d", i, j)
+			}
+		}
 	}
 	cfgStorage, err := raft.OpenFileStorage(dir)
 	if err != nil {
@@ -65,8 +88,19 @@ func Open(dir string, peers []string, selfIndex int, raftToken string, heartbeat
 		}
 		return nil
 	})
-	node.Start()
+	if err := node.Start(); err != nil {
+		_ = cfgStorage.Close()
+		return nil, err
+	}
 	return &Node{Broker: b, Raft: node}, nil
+}
+
+func isLoopback(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (n *Node) Role() raft.Role {

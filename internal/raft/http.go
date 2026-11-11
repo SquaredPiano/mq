@@ -2,8 +2,8 @@ package raft
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
-
 	"fmt"
 	"io"
 	"net/http"
@@ -83,7 +83,7 @@ func HTTPHandler(node *Node, token string) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if r.Header.Get("X-Raft-Token") != token {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Raft-Token")), []byte(token)) != 1 {
 			http.Error(w, "invalid raft token", http.StatusUnauthorized)
 			return
 		}
@@ -100,7 +100,7 @@ func HTTPHandler(node *Node, token string) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if r.Header.Get("X-Raft-Token") != token {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Raft-Token")), []byte(token)) != 1 {
 			http.Error(w, "invalid raft token", http.StatusUnauthorized)
 			return
 		}
@@ -117,6 +117,10 @@ func HTTPHandler(node *Node, token string) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Raft-Token")), []byte(token)) != 1 {
+			http.Error(w, "invalid raft token", http.StatusUnauthorized)
+			return
+		}
 		role, term, commitIndex, lastIndex := node.Status()
 		writeJSON(w, map[string]any{
 			"role":         role,
@@ -130,7 +134,7 @@ func HTTPHandler(node *Node, token string) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if r.Header.Get("X-Raft-Token") != token {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Raft-Token")), []byte(token)) != 1 {
 			http.Error(w, "invalid raft token", http.StatusUnauthorized)
 			return
 		}

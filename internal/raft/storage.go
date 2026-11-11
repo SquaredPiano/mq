@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,8 +16,12 @@ const (
 	metaFileName = "raft.meta"
 	logFileName  = "raft.log"
 	magic        = uint32(0x3BC2A94F)
-	headerSize   = 13
+	headerSize   = 16
+	metaMagic    = uint32(0xBE516C01)
+	metaSize     = metaMagicSize
 )
+
+const metaMagicSize = 4 + 8 + 4 + sha256.Size
 
 type FileStorage struct {
 	dir string
@@ -25,6 +31,16 @@ type FileStorage struct {
 func OpenFileStorage(dir string) (*FileStorage, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) > 11 && (name[:11] == ".raft-meta-" || len(name) > 10 && name[:10] == ".raft-log-") {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
 	}
 	file, err := os.OpenFile(filepath.Join(dir, logFileName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -41,11 +57,19 @@ func (s *FileStorage) LoadMeta() (uint64, int, error) {
 	if err != nil {
 		return 0, -1, err
 	}
-	if len(body) != 12 {
-		return 0, -1, errors.New("raft.meta must contain 12 bytes")
+	if len(body) != metaMagicSize {
+		return 0, -1, fmt.Errorf("raft.meta has %d bytes, want %d", len(body), metaMagicSize)
 	}
-	term := binary.LittleEndian.Uint64(body[:8])
-	votedFor := int(int32(binary.LittleEndian.Uint32(body[8:])))
+	if binary.LittleEndian.Uint32(body[:4]) != metaMagic {
+		return 0, -1, errors.New("raft.meta magic is invalid")
+	}
+	stored := body[metaMagicSize-sha256.Size:]
+	digest := sha256.Sum256(body[:metaMagicSize-sha256.Size])
+	if !bytes.Equal(stored, digest[:]) {
+		return 0, -1, errors.New("raft.meta checksum mismatch")
+	}
+	term := binary.LittleEndian.Uint64(body[4:12])
+	votedFor := int(int32(binary.LittleEndian.Uint32(body[12:16])))
 	return term, votedFor, nil
 }
 
@@ -58,26 +82,29 @@ func syncDir(directory string) error {
 }
 
 func (s *FileStorage) SaveMeta(term uint64, votedFor int) error {
-	body := make([]byte, 12)
-	binary.LittleEndian.PutUint64(body[:8], term)
-	binary.LittleEndian.PutUint32(body[8:], uint32(int32(votedFor)))
+	body := make([]byte, metaMagicSize)
+	binary.LittleEndian.PutUint32(body[:4], metaMagic)
+	binary.LittleEndian.PutUint64(body[4:12], term)
+	binary.LittleEndian.PutUint32(body[12:16], uint32(int32(votedFor)))
+	digest := sha256.Sum256(body[:metaMagicSize-sha256.Size])
+	copy(body[metaMagicSize-sha256.Size:], digest[:])
 	stage, err := os.CreateTemp(s.dir, ".raft-meta-*")
 	if err != nil {
 		return err
 	}
 	stagePath := stage.Name()
 	if _, err := stage.Write(body); err != nil {
-		stage.Close()
-		os.Remove(stagePath)
+		_ = stage.Close()
+		_ = os.Remove(stagePath)
 		return err
 	}
 	if err := stage.Sync(); err != nil {
-		stage.Close()
-		os.Remove(stagePath)
+		_ = stage.Close()
+		_ = os.Remove(stagePath)
 		return err
 	}
 	if err := stage.Close(); err != nil {
-		os.Remove(stagePath)
+		_ = os.Remove(stagePath)
 		return err
 	}
 	if err := os.Rename(stagePath, filepath.Join(s.dir, metaFileName)); err != nil {
@@ -90,9 +117,10 @@ func encodeFrame(entry Entry) []byte {
 	frame := make([]byte, headerSize+len(entry.Command)+4)
 	binary.LittleEndian.PutUint32(frame[:4], magic)
 	binary.LittleEndian.PutUint64(frame[4:12], entry.Term)
-	binary.LittleEndian.PutUint32(frame[9:13], uint32(len(entry.Command)))
+	binary.LittleEndian.PutUint32(frame[12:16], uint32(len(entry.Command)))
 	copy(frame[headerSize:headerSize+len(entry.Command)], entry.Command)
-	binary.LittleEndian.PutUint32(frame[headerSize+len(entry.Command):], crc32.ChecksumIEEE(entry.Command))
+	checksum := crc32.ChecksumIEEE(frame[:headerSize+len(entry.Command)])
+	binary.LittleEndian.PutUint32(frame[headerSize+len(entry.Command):], checksum)
 	return frame
 }
 
@@ -114,31 +142,44 @@ func (s *FileStorage) Load() ([]Entry, error) {
 	var entries []Entry
 	var position uint64
 	for position < uint64(len(buffer)) {
-		if uint64(len(buffer))-position < headerSize {
+		remaining := uint64(len(buffer)) - position
+		if remaining < headerSize {
 			break
 		}
-		header := buffer[position : position+headerSize]
-		if binary.LittleEndian.Uint32(header[:4]) != magic {
+		stored := buffer[position : position+headerSize]
+		if binary.LittleEndian.Uint32(stored[:4]) != magic {
 			break
 		}
-		payloadLength := uint64(binary.LittleEndian.Uint32(header[9:headerSize]))
+		payloadLength := uint64(binary.LittleEndian.Uint32(stored[12:16]))
+		if payloadLength > uint64(1)<<40 {
+			return nil, fmt.Errorf("raft log frame at offset %d declares %d bytes", position, payloadLength)
+		}
 		end := position + headerSize + payloadLength + 4
 		if end > uint64(len(buffer)) {
 			break
 		}
-		stored := buffer[position+headerSize : position+headerSize+payloadLength]
+		payload := buffer[position+headerSize : position+headerSize+payloadLength]
 		checksum := binary.LittleEndian.Uint32(buffer[position+headerSize+payloadLength : end])
-		if crc32.ChecksumIEEE(stored) != checksum {
-			break
+		if crc32.ChecksumIEEE(buffer[position:position+headerSize+payloadLength]) != checksum {
+			return nil, fmt.Errorf("raft log frame at offset %d has a bad checksum", position)
 		}
-		entries = append(entries, Entry{Term: binary.LittleEndian.Uint64(header[4:12]), Command: append([]byte(nil), stored...)})
+		entries = append(entries, Entry{
+			Term:    binary.LittleEndian.Uint64(stored[4:12]),
+			Command: append([]byte(nil), payload...),
+		})
 		position = end
 	}
 	if position < uint64(len(buffer)) {
+		if position == 0 {
+			return nil, fmt.Errorf("raft log is corrupt; refusing to open with %d bytes", len(buffer))
+		}
 		if err := s.log.Truncate(int64(position)); err != nil {
 			return nil, fmt.Errorf("truncate torn raft log tail: %w", err)
 		}
 		if err := s.log.Sync(); err != nil {
+			return nil, err
+		}
+		if err := syncDir(s.dir); err != nil {
 			return nil, err
 		}
 	}
@@ -167,7 +208,7 @@ func (s *FileStorage) TruncateFrom(index uint64) error {
 		return nil
 	}
 	tmp := filepath.Join(s.dir, logFileName+".tmp")
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	stage, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -175,29 +216,32 @@ func (s *FileStorage) TruncateFrom(index uint64) error {
 		if uint64(currentIndex) >= index {
 			break
 		}
-		if _, err := file.Write(encodeFrame(entry)); err != nil {
-			file.Close()
-			os.Remove(tmp)
+		if _, err := stage.Write(encodeFrame(entry)); err != nil {
+			_ = stage.Close()
+			_ = os.Remove(tmp)
 			return err
 		}
 	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(tmp)
+	if err := stage.Sync(); err != nil {
+		_ = stage.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
-	if err := file.Close(); err != nil {
-		os.Remove(tmp)
+	if err := stage.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, filepath.Join(s.dir, logFileName)); err != nil {
 		return err
 	}
-	s.log.Close()
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
 	log, err := os.OpenFile(filepath.Join(s.dir, logFileName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
 	}
+	_ = s.log.Close()
 	s.log = log
 	return nil
 }
@@ -229,12 +273,17 @@ func (m *MemoryStorage) SaveMeta(term uint64, votedFor int) error {
 
 func (m *MemoryStorage) Load() ([]Entry, error) {
 	entries := make([]Entry, len(m.lo))
-	copy(entries, m.lo)
+	for i := range m.lo {
+		entries[i] = Entry{Term: m.lo[i].Term, Command: append([]byte(nil), m.lo[i].Command...)}
+	}
 	return entries, nil
 }
 
 func (m *MemoryStorage) Append(entry Entry, index uint64) error {
-	m.lo = append(m.lo, entry)
+	if index != uint64(len(m.lo))+1 {
+		return fmt.Errorf("append index %d, want %d", index, len(m.lo)+1)
+	}
+	m.lo = append(m.lo, Entry{Term: entry.Term, Command: append([]byte(nil), entry.Command...)})
 	return nil
 }
 

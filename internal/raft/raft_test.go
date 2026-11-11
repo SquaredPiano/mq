@@ -39,7 +39,12 @@ func newCluster(t *testing.T, count int) []*Node {
 	}
 	for _, node := range nodes {
 		next := make([]Peer, count)
-		copy(next, peers)
+		for j, peer := range peers {
+			if peer == node {
+				continue
+			}
+			next[j] = peer
+		}
 		if err := node.SetPeers(next); err != nil {
 			t.Fatal(err)
 		}
@@ -95,12 +100,12 @@ func TestProposesCommitsAcrossQuorum(t *testing.T) {
 	if target == 0 {
 		t.Fatal("returned zero applied index")
 	}
+	tickClusterN(t, nodes, 20)
 	for i, node := range nodes {
 		if node.CommitIndex() < target {
 			t.Fatalf("node %d commitIndex = %d, want >= %d", i, node.CommitIndex(), target)
 		}
 	}
-	tickClusterN(t, nodes, 10)
 }
 
 type flakyPeer struct {
@@ -124,36 +129,35 @@ func (p *flakyPeer) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 func TestIsolatedNodeCannotElectItself(t *testing.T) {
 	nodes := newCluster(t, 3)
-	mem := []*flakyPeer{}
-	for _, node := range nodes {
-		mem = append(mem, &flakyPeer{node: node})
-	}
-	peers := make([]Peer, len(nodes))
-	for i, peer := range mem {
-		peers[i] = peer
-	}
-	for _, node := range nodes {
-		local := make([]Peer, len(nodes))
-		copy(local, peers)
-		if err := node.SetPeers(local); err != nil {
+	proxies := make([][]Peer, 3)
+	for i, node := range nodes {
+		peers := make([]Peer, 3)
+		for j, target := range nodes {
+			if i == j {
+				continue
+			}
+			peers[j] = &flakyPeer{node: target}
+		}
+		proxies[i] = peers
+		if err := node.SetPeers(peers); err != nil {
 			t.Fatal(err)
 		}
 	}
-	tickClusterN(t, nodes, 30)
-	leader := findsLeader(nodes)
+	proxies[0][1].(*flakyPeer).drop = true
+	proxies[0][2].(*flakyPeer).drop = true
+	proxies[1][0].(*flakyPeer).drop = true
+	proxies[2][0].(*flakyPeer).drop = true
+	tickClusterN(t, nodes, 50)
+	if nodes[0].StateRole() == Leader {
+		t.Fatal("isolated node became leader")
+	}
+	leader := findsLeader(nodes[1:])
 	if leader == -1 {
-		t.Fatal("no leader")
+		t.Fatal("no leader among remaining nodes")
 	}
-	for _, peer := range mem {
-		if peer.node == nodes[leader] {
-			continue
-		}
-		peer.drop = true
-	}
-	_ = leader
 }
 
-func TestLaggingFollowerCatchesUpNotTestedYet(t *testing.T) {
+func TestLaggingFollowerCatchesUp(t *testing.T) {
 	nodes := newCluster(t, 3)
 	tickClusterN(t, nodes, 30)
 	leader := findsLeader(nodes)

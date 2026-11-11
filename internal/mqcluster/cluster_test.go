@@ -140,24 +140,38 @@ func TestClusterLeaderFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		synchronized := true
+		for i, node := range nodes {
+			if i == leaderIdx {
+				continue
+			}
+			value, err := node.Broker.Fetch("events", 0, 1)
+			if err != nil || len(value) != 1 || !bytes.Equal(value[0].Value, []byte("still-here")) {
+				synchronized = false
+				time.Sleep(10 * time.Millisecond)
+				break
+			}
+		}
+		if synchronized {
+			break
+		}
+	}
+	servers0[leaderIdx].Close()
+	nodes[leaderIdx].Close()
+	_ = waitForLeaderExcept(t, nodes, leaderIdx, 5*time.Second)
 	for i, node := range nodes {
+		if i == leaderIdx {
+			continue
+		}
 		value, err := node.Broker.Fetch("events", 0, 1)
 		if err != nil {
 			t.Fatalf("node %d fetch: %v", i, err)
 		}
 		if len(value) != 1 || !bytes.Equal(value[0].Value, []byte("still-here")) {
-			t.Fatalf("node %d value mismatch", i)
+			t.Fatalf("node %d value = %q", i, value)
 		}
-	}
-	servers0[leaderIdx].Config.Handler = http.NewServeMux()
-	nodes[leaderIdx].Close()
-	newLeader := waitForLeaderExcept(t, nodes, leaderIdx, 5*time.Second)
-	value, err := nodes[newLeader].Broker.Fetch("events", 0, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(value) != 1 || !bytes.Equal(value[0].Value, []byte("still-here")) {
-		t.Fatalf("new leader value = %v", value)
 	}
 }
 
