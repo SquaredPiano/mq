@@ -17,6 +17,7 @@ var ErrStartOffsetRegression = errors.New("retention start cannot move backwards
 
 type Record struct {
 	Offset    uint64    `json:"offset"`
+	Partition uint8     `json:"partition"`
 	Key       []byte    `json:"key"`
 	Value     []byte    `json:"value"`
 	Timestamp time.Time `json:"timestamp"`

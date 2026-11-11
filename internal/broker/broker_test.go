@@ -90,3 +90,79 @@ func TestDurablePublishFetchCommitRetainAndReopen(t *testing.T) {
 		t.Fatalf("new group = %#v, err %v", fresh, err)
 	}
 }
+
+func TestPartitionedPublishFetchReopen(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = queue.Publish("events", []byte("key-1"), []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = queue.Publish("events", []byte("key-2"), []byte("two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, err := queue.Fetch("events", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("got %d records, want 2", len(recs))
+	}
+	for _, r := range recs {
+		if r.Partition >= 4 {
+			t.Fatalf("record has bad partition %d", r.Partition)
+		}
+	}
+}
+
+func TestKeyRoutingIsConsistent(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := queue.Publish("events", []byte("user-42"), []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := queue.Publish("events", []byte("user-42"), []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("expected different offsets for repeat publish, got %d", first)
+	}
+	for i := 1; i < 60; i++ {
+		if _, err := queue.Publish("events", []byte("user-42"), []byte("ok")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs, err := queue.Fetch("events", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partition byte
+	set := false
+	for _, r := range recs {
+		if !set {
+			partition = byte(r.Partition)
+			set = true
+			continue
+		}
+		if byte(r.Partition) != partition {
+			t.Fatalf("partition drifted from %d to %d mid-key", partition, r.Partition)
+		}
+	}
+}

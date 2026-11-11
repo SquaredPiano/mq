@@ -107,7 +107,7 @@ func (b *Broker) captureSnapshot(generation uint64, walOffset int64) brokerSnaps
 	}
 
 	b.mu.RLock()
-	topics := make(map[string]*messageLog.Log, len(b.topics))
+	topics := make(map[string]*messageLog.PartitionedLog, len(b.topics))
 	for name, topicLog := range b.topics {
 		topics[name] = topicLog
 	}
@@ -168,7 +168,7 @@ func (b *Broker) captureSnapshot(generation uint64, walOffset int64) brokerSnaps
 }
 
 type snapshotState struct {
-	topics    map[string]*messageLog.Log
+	topics    map[string]*messageLog.PartitionedLog
 	committed map[groupTopic]uint64
 	requests  map[string]publishResult
 }
@@ -185,7 +185,7 @@ func buildSnapshotState(snapshot brokerSnapshot) (*snapshotState, error) {
 	}
 
 	state := &snapshotState{
-		topics:    make(map[string]*messageLog.Log),
+		topics:    make(map[string]*messageLog.PartitionedLog),
 		committed: make(map[groupTopic]uint64),
 		requests:  make(map[string]publishResult),
 	}
@@ -196,7 +196,7 @@ func buildSnapshotState(snapshot brokerSnapshot) (*snapshotState, error) {
 		if _, exists := state.topics[item.Name]; exists {
 			return nil, fmt.Errorf("duplicate topic %q in snapshot", item.Name)
 		}
-		topicLog, err := messageLog.RestoreOwned(item.StartOffset, item.EndOffset, item.Records)
+		topicLog, err := messageLog.RestorePartitionedOwned(item.StartOffset, item.EndOffset, item.Records, 1)
 		if err != nil {
 			return nil, fmt.Errorf("restore topic %q: %w", item.Name, err)
 		}

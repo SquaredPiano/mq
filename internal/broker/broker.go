@@ -58,6 +58,8 @@ type OpenOptions struct {
 	GroupCommitWindow time.Duration
 
 	WALSegmentBytes int64
+
+	PartitionCount int
 }
 
 type GroupCommitStats struct {
@@ -120,7 +122,7 @@ type Broker struct {
 	publishSubmit      sync.Mutex
 	mu                 sync.RWMutex
 	walMu              sync.RWMutex
-	topics             map[string]*messageLog.Log
+	topics             map[string]*messageLog.PartitionedLog
 	committed          map[groupTopic]uint64
 	requests           map[string]publishResult
 	wal                *wal.WAL
@@ -145,16 +147,18 @@ type Broker struct {
 	groupCommitWindow  time.Duration
 	groupCommitGroups  atomic.Uint64
 	groupCommitFrames  atomic.Uint64
+	partitionCount     int
 }
 
 func New() *Broker {
-	return &Broker{}
+	return &Broker{partitionCount: 1}
 }
 
 func Open(dataDir string) (*Broker, error) {
 	return OpenWithOptions(dataDir, OpenOptions{
 		GroupCommitWindow: DefaultGroupCommitWindow,
 		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    1,
 	})
 }
 
@@ -203,6 +207,7 @@ func OpenWithOptions(dataDir string, options OpenOptions) (*Broker, error) {
 		dataDir:           dataDir,
 		groupCommitWindow: options.GroupCommitWindow,
 		segmentBytes:      options.WALSegmentBytes,
+		partitionCount:    options.PartitionCount,
 	}
 	snapshot, digest, fileSize, err := loadSnapshot(filepath.Join(dataDir, snapshotFileName))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1524,7 +1529,7 @@ func writeDigestField(hasher hash.Hash, value []byte) {
 	_, _ = hasher.Write(value)
 }
 
-func (b *Broker) topicForAppend(topic string) *messageLog.Log {
+func (b *Broker) topicForAppend(topic string) *messageLog.PartitionedLog {
 	b.mu.RLock()
 	topicLog := b.topics[topic]
 	b.mu.RUnlock()
@@ -1536,10 +1541,19 @@ func (b *Broker) topicForAppend(topic string) *messageLog.Log {
 	defer b.mu.Unlock()
 
 	if b.topics == nil {
-		b.topics = make(map[string]*messageLog.Log)
+		b.topics = make(map[string]*messageLog.PartitionedLog)
 	}
 	if topicLog = b.topics[topic]; topicLog == nil {
-		topicLog = &messageLog.Log{}
+		partid := b.partitionCount
+		if partid == 0 {
+			partid = 1
+		}
+		var err error
+		topicLog, err = messageLog.NewPartitionedLog(partid)
+		if err != nil {
+			topicLog = nil
+			return nil
+		}
 		b.topics[topic] = topicLog
 	}
 	return topicLog
