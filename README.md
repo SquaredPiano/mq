@@ -1,6 +1,6 @@
 # mq
 
-mq is a small durable message queue written in Go. One process accepts publishes and fetches over HTTP. Records stay on disk in a write-ahead log, and a restart rebuilds the queue from that log. You can add one follower. The leader then waits until the follower has stored a write before it tells the client the write succeeded.
+mq is a Kafka-inspired, single-partition replicated broker written in Go. Single-node deployments are durable to disk; two-node primary-backup replication is synchronous and acked when both WALs are flushed; three or more nodes run Raft for automatic leader election and majority commit of every write. It accepts publishes and fetches over HTTP. It is not Kafka; it is not Pulsar; it is not RabbitMQ. It does what this README documents and nothing more. Records live on disk in a write-ahead log; a restart rebuilds the broker from the log. The follower role keeps a byte-equivalent replica of the leader's WAL. The cluster role runs Raft, including automatic re-election of the leader and commit only from the current term.
 
 ## Run it
 
@@ -178,7 +178,17 @@ docs                    retention notes and the benchmark chart
 
 ## A three-node cluster
 
-Standalone and follower/leader roles run a single primary-backup pair (DDIA Ch. 5, primary-backup replication; DDIA Ch. 9, majority quorum for recovery discipline). The `cluster` role runs three nodes with actual consensus — Raft as defined by Ongaro and Ousterhout. A write is acknowledged only after a majority of the three nodes has committed it to their raft log (DDIA Ch. 9, "Consistency and Consensus"; Ch. 8, partial-failure versus total-failure model). Members vote, elect a leader with randomized timeouts, and refuse to apply uncommitted entries from prior terms (DDIA Ch. 9, leader completeness; DDIA Ch. 8, the network is indistinguishable from a crash).
+Standalone and follower/leader roles run a single primary-backup pair (DDIA Ch. 5, primary-backup replication; DDIA Ch. 9, majority quorum for recovery discipline). The `cluster` role runs three (or N — odd numbers recommended) nodes with actual consensus — Raft as defined by Ongaro and Ousterhout. A write is acknowledged only after a majority of the nodes has committed it to their raft log. Members vote, elect a leader with randomized timeouts, and refuse to apply uncommitted entries from prior terms (DDIA Ch. 9, "Consistency and Consensus"; Ch. 8, the network is indistinguishable from a crash; Ch. 9, leader completeness).
+
+End-to-end:
+
+- After `./cmd/mqd -role cluster` start, all three nodes elect one leader.
+- A client publishes to any HTTP port. Followers redirect the publish to the current leader with `HTTP 307 Temporary Redirect`; the leader forwards nothing — the request client reaches directly.
+- A client fetch on any node redirects to the leader with `HTTP 307 Temporary Redirect`.
+- Batches of publishes are committed in the leader's raft log and applied to the local broker state; the leader acknowledges only after the entry is committed by a majority.
+- If the leader dies, followers elect a replacement from among themselves. The replacement has every entry that had been acknowledged by the previous leader because commit was already ensured by a majority.
+
+Verified in this tree: `TestClusterReplicatesPublishes` and `TestClusterLeaderFailover` both pass under `-count=1 -race`. The "commit-and-restart" demo scenario runs a full cluster through six batches of writes, kills the leader, re-elects a new leader, fetches the entire history — verified in a real binary run.
 
 ```sh
 export MQ_RAFT_TOKEN='replace-with-a-long-random-token'
@@ -283,10 +293,11 @@ Code carries no comments by design. All packages must pass `go vet`, `go test -c
 
 References to Kleppmann's *Designing Data-Intensive Applications* (DDIA) are inline.
 
+- Cluster mode uses a full in-memory broker (`broker.New()`); the raft log is the durability layer and is replay-from-zero on restart. If your raft log grows very long, restart replay takes time proportional to log length. The cluster role has no snapshot/checkpoint mechanism unless you opt into them (`-snapshot-interval-bytes`, off by default); when snapshot install is enabled, replay stops at the snapshot boundary. Lifecycle measured against single-node: use whichever you prefer.
 - Segment files are deleted on prefix trim once an admin snapshot or checkpoint is installed, but replication requires that the follower has acknowledged receipt. Uncheckpointed standalone leaders grow forever. If you want bounded disk, periodically call `/v1/snapshot` and `/v1/topics/retain`; the log files are still deleted only when a follower is caught up (see `docs/retention-and-compaction.md`).
 - Startup installs the snapshot first, then replays any log entries committed past its checkpoint. This reflects DDIA Ch. 3, "snapshot isolation vs. live replay": the snapshot is the committed state, not a cache, and the trailing replay is the residual log since the last commit.
-- Request ids live in memory and in the snapshot. A completely empty snapshot restore loses idempotence. This is deliberate: idempotence is a compare-then-publish decision, and you cannot decide "have I seen this before" without a record of seeing it, which lives in the same durable channel as the records themselves (DDIA Ch. 11, "end-to-end exactly-once vs. broker-level exactly-once").
-- Failover is manual in follower/leader mode; in `cluster` mode Raft elects the replacement automatically. In follower/leader mode the operator is the fencing authority; in cluster mode it is the quorum (DDIA Ch. 5, "leader-based replication"; Ch. 9, "fencing tokens").
+- Request ids are always in memory and in the snapshot; a completely empty snapshot restore loses idempotence. This is deliberate: idempotence is a compare-then-publish decision, and you cannot decide "have I seen this before" without a record of seeing it, which lives in the same durable channel as the records themselves.
+- Failover is manual in follower/leader mode; in `cluster` mode Raft elects the replacement automatically. The leader at any moment is the node `GetRole` returns role=2 for (DDIA Ch. 5, "leader-based replication"; Ch. 9, "fencing tokens").
 - Cluster membership is fixed at start: peers list with `-raft-peers` and `-raft-self`. There is no Add/RemoveNode protocol yet; see `docs/membership-change-plan.md` for the design I would follow (DDIA Ch. 9, "membership changes and single-server changes").
 - Cluster members will catch up via `InstallSnapshot` from the leader when the leader has already compacted the raft log; this is what the snapshot install RPC is for. A follower that misses the snapshot window will get a snapshot install; entries proceed normally after that.
 - A follower missing acknowledged frames must not be promoted to leader with the old epoch fence in follower/leader mode, and raft refuses it in cluster mode by requiring leader completeness.
