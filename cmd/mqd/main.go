@@ -150,7 +150,21 @@ func run() (runErr error) {
 			}
 			cluster = nil
 		}()
-		base, err := httpapi.NewAuthenticatedHandlerWithAdmin(cluster.Broker, *clientToken, *adminToken)
+		localIndex := *raftSelf
+		localPeers := strings.Split(*raftPeers, ",")
+		resolver := func(scope string) (string, bool) {
+			_ = scope
+			if cluster.Raft.StateRole() == raft.Leader {
+				return localPeers[localIndex], true
+			}
+			id := cluster.Raft.LeaderID()
+			if id >= 0 && id < len(localPeers) {
+				return localPeers[id], true
+			}
+			return "", false
+		}
+		selfURL := localPeers[localIndex]
+		base, err := httpapi.NewAuthenticatedHandlerWithLeader(cluster.Broker, *clientToken, *adminToken, selfURL, resolver)
 		if err != nil {
 			return err
 		}

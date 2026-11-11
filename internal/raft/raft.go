@@ -125,6 +125,7 @@ type Node struct {
 	stop        chan struct{}
 	done        chan struct{}
 	stopOnce    sync.Once
+	leaderID    int
 	fatalErr    error
 	ticks       uint64
 	electionAt  uint64
@@ -180,6 +181,7 @@ func New(cfg Config, peers []Peer, fsm FSM) (*Node, error) {
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 		heartbeatAt: 0,
+		leaderID:    -1,
 	}
 	n.loadSnapshotLocked()
 	n.resetElectionDeadlineLocked()
@@ -397,6 +399,7 @@ func (n *Node) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		}
 		n.term = args.Term
 	}
+	n.leaderID = args.LeaderID
 	n.resetElectionDeadlineLocked()
 	prevIdx, prevTerm := args.PrevLogIndex, args.PrevLogTerm
 	if prevIdx > n.lastIndexLocked() {
@@ -630,6 +633,7 @@ func (n *Node) startElectionLocked() {
 
 func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
+	n.leaderID = n.cfg.Self
 	n.matchIndex = make([]uint64, len(n.peers))
 	n.nextIndex = make([]uint64, len(n.peers))
 	for i := range n.peers {
@@ -823,6 +827,12 @@ func (n *Node) LastLogTerm() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.lastTermLocked()
+}
+
+func (n *Node) LeaderID() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.leaderID
 }
 
 func (n *Node) CurrentTerm() uint64 {

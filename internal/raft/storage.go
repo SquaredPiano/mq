@@ -197,17 +197,17 @@ func (s *FileStorage) WriteSnapshot(record SnapshotRecord) error {
 		return err
 	}
 	if _, err := file.Write(frame); err != nil {
-		file.Close()
-		os.Remove(stage)
+		_ = file.Close()
+		_ = os.Remove(stage)
 		return err
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(stage)
+		_ = file.Close()
+		_ = os.Remove(stage)
 		return err
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(stage)
+		_ = os.Remove(stage)
 		return err
 	}
 	if err := os.Rename(stage, final); err != nil {
@@ -225,7 +225,7 @@ func (s *FileStorage) TruncatePrefix(count uint64) error {
 		return err
 	}
 	if uint64(len(current)) <= count {
-		s.log.Close()
+		_ = s.log.Close()
 		if err := os.Truncate(filepath.Join(s.dir, logFileName), 0); err != nil {
 			return fmt.Errorf("truncate raft log prefix: %w", err)
 		}
@@ -247,13 +247,13 @@ func (s *FileStorage) TruncatePrefix(count uint64) error {
 	}
 	for _, entry := range kept {
 		if _, err := file.Write(encodeFrame(entry)); err != nil {
-			file.Close()
+			_ = file.Close()
 			_ = os.Remove(tmp)
 			return err
 		}
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
+		_ = file.Close()
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -267,7 +267,7 @@ func (s *FileStorage) TruncatePrefix(count uint64) error {
 	if err := syncDir(s.dir); err != nil {
 		return err
 	}
-	s.log.Close()
+	_ = s.log.Close()
 	log, err := os.OpenFile(filepath.Join(s.dir, logFileName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return err

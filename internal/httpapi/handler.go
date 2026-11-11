@@ -15,6 +15,8 @@ import (
 	messageLog "mq/internal/log"
 )
 
+type LeaderResolver func(scope string) (baseURL string, ok bool)
+
 const (
 	maxRequestBytes = 1 << 20
 	maxMessageBytes = 256 << 10
@@ -25,6 +27,8 @@ const (
 type API struct {
 	broker                     *broker.Broker
 	readOnly                   bool
+	leaderResolver             LeaderResolver
+	selfURL                    string
 	requireRequestID           bool
 	clientToken                string
 	adminToken                 string
@@ -106,6 +110,20 @@ func NewAuthenticatedHandlerWithAdmin(b *broker.Broker, clientToken, adminToken 
 
 func NewLeaderHandler(b *broker.Broker, replicationToken string, metrics func() (any, error)) (http.Handler, error) {
 	return NewAuthenticatedLeaderHandler(b, replicationToken, "", metrics)
+}
+
+func NewAuthenticatedHandlerWithLeader(b *broker.Broker, clientToken, adminToken string, selfURL string, resolve LeaderResolver) (http.Handler, error) {
+	if adminToken != "" && adminToken == clientToken {
+		return nil, errors.New("client and admin tokens must be different")
+	}
+	if resolve == nil {
+		return nil, errors.New("leader resolver is required in cluster mode")
+	}
+	if selfURL == "" {
+		return nil, errors.New("self URL is required in cluster mode")
+	}
+	a := &API{broker: b, clientToken: clientToken, adminToken: adminToken, leaderResolver: resolve, selfURL: selfURL}
+	return a.handler(), nil
 }
 
 func NewAuthenticatedLeaderHandler(b *broker.Broker, replicationToken, clientToken string, metrics func() (any, error)) (http.Handler, error) {
@@ -306,6 +324,13 @@ func (a *API) publishBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) fetch(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/fetch"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if !requirePost(w, r) {
 		return
 	}

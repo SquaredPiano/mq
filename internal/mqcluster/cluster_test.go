@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,11 +68,27 @@ func newTestCluster(t *testing.T, count int) ([]*Node, []*httptest.Server, []str
 		}
 		rng := muxHandler(node.Raft, token)
 		holders[i].raft = rng
-		admin, err := httpapi.NewAuthenticatedHandlerWithAdmin(node.Broker, "", "")
+		selfURL := urls[i]
+		resolver := func(scope string) (string, bool) {
+			_ = scope
+			if node.Raft.StateRole() == raft.Leader {
+				return selfURL, true
+			}
+			id := node.Raft.LeaderID()
+			if id >= 0 && id < len(urls) {
+				return urls[id], true
+			}
+			return "", false
+		}
+		admin, err := httpapi.NewAuthenticatedHandlerWithLeader(node.Broker, "", "", selfURL, resolver)
 		if err != nil {
 			t.Fatal(err)
 		}
 		holders[i].api = admin
+	}
+	for i, h := range holders {
+		_ = h
+		_ = i
 	}
 	t.Cleanup(func() {
 		for _, node := range nodes {
@@ -195,3 +213,52 @@ func waitForLeaderExcept(t *testing.T, nodes []*Node, excluded int, timeout time
 
 var _ = json.Marshal
 var _ = fmt.Sprint
+
+func TestFollowerRedirectsFetchToLeader(t *testing.T) {
+	nodes, _, urls, _ := newTestCluster(t, 3)
+	leaderIdx := waitForLeader(t, nodes, 5*time.Second)
+
+	if _, err := nodes[leaderIdx].Broker.PublishWithID("events", "req-fetch-redirect", []byte("k"), []byte("redirect-me")); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		follower := (leaderIdx + 1) % 3
+		role, _, _, _ := nodes[follower].Raft.Status()
+		if role == raft.Leader {
+			follower = (leaderIdx + 2) % 3
+		}
+		urlFetch := urls[follower] + "/v1/fetch"
+		req, err := http.NewRequest(http.MethodPost, urlFetch, bytes.NewReader([]byte(`{"topic":"events","offset":0,"limit":1}`)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode == http.StatusTemporaryRedirect {
+			loc := resp.Header.Get("Location")
+			if !strings.HasPrefix(loc, urls[leaderIdx]) {
+				t.Fatalf("redirect Location %q does not point at leader %s", loc, urls[leaderIdx])
+			}
+			return
+		}
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		bodyBytes := append([]byte(nil), body...)
+		t.Logf("unexpected status %d: %s", resp.StatusCode, bodyBytes)
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("follower did not redirect fetch within 2s")
+}
