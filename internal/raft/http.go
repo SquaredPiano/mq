@@ -16,6 +16,22 @@ type HTTPPeer struct {
 	Client  *http.Client
 }
 
+func (p HTTPPeer) InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	body, err := json.Marshal(args)
+	if err != nil {
+		return InstallSnapshotReply{}
+	}
+	reply, err := p.post("/raft/install-snapshot", body)
+	if err != nil {
+		return InstallSnapshotReply{}
+	}
+	var out InstallSnapshotReply
+	if err := json.Unmarshal(reply, &out); err != nil {
+		return InstallSnapshotReply{}
+	}
+	return out
+}
+
 func (p HTTPPeer) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	body, err := json.Marshal(args)
 	if err != nil {
@@ -93,6 +109,23 @@ func HTTPHandler(node *Node, token string) http.Handler {
 			return
 		}
 		reply := node.RequestVote(args)
+		writeJSON(w, reply)
+	})
+	mux.HandleFunc("/raft/install-snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Raft-Token")), []byte(token)) != 1 {
+			http.Error(w, "invalid raft token", http.StatusUnauthorized)
+			return
+		}
+		var args InstallSnapshotArgs
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&args); err != nil {
+			http.Error(w, "could not decode install snapshot args", http.StatusBadRequest)
+			return
+		}
+		reply := node.InstallSnapshot(args)
 		writeJSON(w, reply)
 	})
 	mux.HandleFunc("/raft/append-entries", func(w http.ResponseWriter, r *http.Request) {

@@ -1,4 +1,5 @@
 package broker
+
 import (
 	"encoding/json"
 	"fmt"
@@ -15,12 +16,12 @@ func NewRaftFSM(b *Broker) *RaftFSM {
 }
 
 type raftSnapshotEnvelope struct {
-	Version1            uint16 `json:"version"`
-	LastIncludedIndex   uint64 `json:"last_included_index"`
-	LastIncludedTerm    uint64 `json:"last_included_term"`
-	Topics              []topicSnapshot   `json:"topics,omitempty"`
-	Groups              []groupSnapshot   `json:"groups,omitempty"`
-	Requests            []requestSnapshot `json:"requests,omitempty"`
+	Version1          uint16            `json:"version"`
+	LastIncludedIndex uint64            `json:"last_included_index"`
+	LastIncludedTerm  uint64            `json:"last_included_term"`
+	Topics            []topicSnapshot   `json:"topics,omitempty"`
+	Groups            []groupSnapshot   `json:"groups,omitempty"`
+	Requests          []requestSnapshot `json:"requests,omitempty"`
 }
 
 const raftSnapshotVersion = uint16(1)

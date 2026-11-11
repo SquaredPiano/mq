@@ -38,6 +38,18 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          int
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term uint64
+}
+
 type AppendEntriesArgs struct {
 	Term         uint64
 	LeaderID     int
@@ -57,10 +69,13 @@ type AppendEntriesReply struct {
 type Peer interface {
 	RequestVote(args RequestVoteArgs) RequestVoteReply
 	AppendEntries(args AppendEntriesArgs) AppendEntriesReply
+	InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply
 }
 
 type FSM interface {
 	Apply([]byte) error
+	Snapshot() ([]byte, error)
+	InstallSnapshot(data []byte, lastIncludedIndex uint64, lastIncludedTerm uint64) error
 }
 
 type Storage interface {
@@ -69,6 +84,9 @@ type Storage interface {
 	Load() ([]Entry, error)
 	Append(entry Entry, index uint64) error
 	TruncateFrom(index uint64) error
+	TruncatePrefix(count uint64) error
+	LoadSnapshot() (*SnapshotRecord, error)
+	WriteSnapshot(record SnapshotRecord) error
 	Close() error
 }
 
@@ -80,6 +98,8 @@ type Config struct {
 	ElectionMaxTicks uint64
 	HeartbeatTicks   uint64
 	Random           *rand.Rand
+
+	SnapshotThreshold uint64
 }
 
 type Node struct {
@@ -89,15 +109,18 @@ type Node struct {
 	started bool
 	storage Storage
 
-	mu          sync.Mutex
-	log         []Entry
-	term        uint64
-	votedFor    int
-	role        Role
-	commitIndex uint64
-	lastApplied uint64
-	nextIndex   []uint64
-	matchIndex  []uint64
+	mu            sync.Mutex
+	log           []Entry
+	snapshotIndex uint64
+	snapshotTerm  uint64
+	snapshotData  []byte
+	term          uint64
+	votedFor      int
+	role          Role
+	commitIndex   uint64
+	lastApplied   uint64
+	nextIndex     []uint64
+	matchIndex    []uint64
 
 	stop        chan struct{}
 	done        chan struct{}
@@ -158,8 +181,31 @@ func New(cfg Config, peers []Peer, fsm FSM) (*Node, error) {
 		done:        make(chan struct{}),
 		heartbeatAt: 0,
 	}
+	n.loadSnapshotLocked()
 	n.resetElectionDeadlineLocked()
 	return n, nil
+}
+
+func (n *Node) loadSnapshotLocked() {
+	snapshot, err := n.storage.LoadSnapshot()
+	if err != nil || snapshot == nil {
+		return
+	}
+	n.snapshotIndex = snapshot.Index
+	n.snapshotTerm = snapshot.Term
+	n.snapshotData = snapshot.Data
+	n.commitIndex = snapshot.Index
+	n.lastApplied = snapshot.Index
+	if err := n.fsm.InstallSnapshot(snapshot.Data, snapshot.Index, snapshot.Term); err != nil {
+		n.haltLocked(err)
+		return
+	}
+	for i := range n.peers {
+		if n.peers[i] == nil || i == n.cfg.Self {
+			continue
+		}
+		n.nextIndex[i] = snapshot.Index + 1
+	}
 }
 
 func (n *Node) Start() error {
@@ -260,7 +306,7 @@ func (n *Node) stepdownLocked(term uint64) {
 }
 
 func (n *Node) lastIndexLocked() uint64 {
-	return uint64(len(n.log))
+	return n.snapshotIndex + uint64(len(n.log))
 }
 
 func (n *Node) lastTermLocked() uint64 {
@@ -271,10 +317,27 @@ func (n *Node) lastTermLocked() uint64 {
 }
 
 func (n *Node) logTermAtLocked(index uint64) uint64 {
-	if index == 0 || index > uint64(len(n.log)) {
+	if index == 0 {
 		return 0
 	}
-	return n.log[index-1].Term
+	if index == n.snapshotIndex {
+		return n.snapshotTerm
+	}
+	if index > n.snapshotIndex && index <= n.lastIndexLocked() {
+		return n.log[index-n.snapshotIndex-1].Term
+	}
+	return 0
+}
+
+func (n *Node) entryAtLocked(index uint64) (Entry, bool) {
+	if index == 0 || index <= n.snapshotIndex {
+		return Entry{}, false
+	}
+	pos := index - n.snapshotIndex - 1
+	if pos >= uint64(len(n.log)) {
+		return Entry{}, false
+	}
+	return n.log[pos], true
 }
 
 func min(a, b uint64) uint64 {
@@ -384,6 +447,28 @@ func (n *Node) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	return AppendEntriesReply{Term: n.term, Success: true, MatchIndex: prevIdx + uint64(len(args.Entries))}
 }
 
+func (n *Node) sendSnapshotLocked(i int, peer Peer) {
+	if n.snapshotIndex == 0 {
+		return
+	}
+	n.mu.Unlock()
+	args := InstallSnapshotArgs{
+		Term:              n.term,
+		LeaderID:          n.cfg.Self,
+		LastIncludedIndex: n.snapshotIndex,
+		LastIncludedTerm:  n.snapshotTerm,
+		Data:              append([]byte(nil), n.snapshotData...),
+	}
+	reply := peer.InstallSnapshot(args)
+	n.mu.Lock()
+	if reply.Term > n.term {
+		n.stepdownLocked(reply.Term)
+		return
+	}
+	n.matchIndex[i] = n.snapshotIndex
+	n.nextIndex[i] = n.snapshotIndex + 1
+}
+
 func (n *Node) broadcastAppendEntriesLocked() {
 	if n.role != Leader {
 		return
@@ -397,15 +482,21 @@ func (n *Node) broadcastAppendEntriesLocked() {
 		if next == 0 {
 			next = n.lastIndexLocked() + 1
 		}
+		if next <= n.snapshotIndex && n.snapshotIndex > 0 {
+			n.sendSnapshotLocked(i, peer)
+			continue
+		}
 		prev := next - 1
 		prevTerm := n.logTermAtLocked(prev)
 		var entries []Entry
 		if next-1 < n.lastIndexLocked() {
-			last := uint64(len(n.log))
+			last := n.lastIndexLocked()
 			if last-(next-1) > 64 {
 				last = next - 1 + 64
 			}
-			entries = append([]Entry(nil), n.log[next-1:last]...)
+			start := next - n.snapshotIndex - 1
+			end := last - n.snapshotIndex
+			entries = append([]Entry(nil), n.log[start:end]...)
 		}
 		argsList[i] = AppendEntriesArgs{
 			Term:         n.term,
@@ -567,7 +658,7 @@ func (n *Node) appendEntryLocked(entry Entry) error {
 }
 
 func (n *Node) truncateFromLocked(index uint64) error {
-	if uint64(len(n.log)) < index {
+	if index == 0 || index-1 >= uint64(len(n.log)) {
 		return nil
 	}
 	if err := n.storage.TruncateFrom(index - 1); err != nil {
@@ -579,12 +670,17 @@ func (n *Node) truncateFromLocked(index uint64) error {
 
 func (n *Node) applyCommittedLocked() {
 	for n.lastApplied < n.commitIndex {
-		entry := n.log[n.lastApplied]
+		next := n.lastApplied + 1
+		entry, ok := n.entryAtLocked(next)
+		if !ok {
+			return
+		}
 		if err := n.fsm.Apply(entry.Command); err != nil {
 			n.haltLocked(err)
 			return
 		}
-		n.lastApplied++
+		n.lastApplied = next
+		n.maybeSnapshotLocked()
 	}
 }
 
@@ -629,6 +725,59 @@ func (n *Node) Propose(command []byte) (uint64, error) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func (n *Node) InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.fatalErr != nil {
+		return InstallSnapshotReply{}
+	}
+	if args.Term < n.term {
+		return InstallSnapshotReply{Term: n.term}
+	}
+	n.role = Follower
+	if args.Term > n.term {
+		if err := n.storage.SaveMeta(args.Term, -1); err != nil {
+			n.haltLocked(err)
+			return InstallSnapshotReply{}
+		}
+		n.term = args.Term
+	}
+	n.resetElectionDeadlineLocked()
+	if args.LastIncludedIndex <= n.snapshotIndex {
+		return InstallSnapshotReply{Term: n.term}
+	}
+	rec := SnapshotRecord{Index: args.LastIncludedIndex, Term: args.LastIncludedTerm, Data: append([]byte(nil), args.Data...)}
+	if err := n.storage.WriteSnapshot(rec); err != nil {
+		n.haltLocked(err)
+		return InstallSnapshotReply{}
+	}
+	truncateCount := rec.Index - n.snapshotIndex
+	if truncateCount > 0 {
+		if err := n.storage.TruncatePrefix(truncateCount); err != nil {
+			n.haltLocked(err)
+			return InstallSnapshotReply{}
+		}
+		n.log = n.log[truncateCount:]
+	}
+	n.snapshotIndex = rec.Index
+	n.snapshotTerm = rec.Term
+	n.snapshotData = rec.Data
+	n.commitIndex = rec.Index
+	n.lastApplied = rec.Index
+	for j := range n.peers {
+		if j == n.cfg.Self {
+			continue
+		}
+		n.matchIndex[j] = rec.Index
+		n.nextIndex[j] = rec.Index + 1
+	}
+	if err := n.fsm.InstallSnapshot(rec.Data, rec.Index, rec.Term); err != nil {
+		n.haltLocked(err)
+		return InstallSnapshotReply{}
+	}
+	return InstallSnapshotReply{Term: n.term}
 }
 
 func (n *Node) Status() (role Role, term uint64, commitIndex uint64, lastIndex uint64) {
@@ -692,4 +841,57 @@ func (n *Node) CommitIndex() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.commitIndex
+}
+
+func (n *Node) maybeSnapshotLocked() {
+	threshold := n.cfg.SnapshotThreshold
+	if threshold == 0 || n.lastApplied <= n.snapshotIndex {
+		return
+	}
+	if n.lastApplied-n.snapshotIndex < threshold {
+		return
+	}
+	target := n.lastApplied
+	term, ok := n.entryTermLocked(target)
+	if !ok {
+		return
+	}
+	data, err := n.fsm.Snapshot()
+	if err != nil {
+		n.haltLocked(err)
+		return
+	}
+	rec := SnapshotRecord{Index: target, Term: term, Data: data}
+	if err := n.storage.WriteSnapshot(rec); err != nil {
+		n.haltLocked(err)
+		return
+	}
+	m := target - n.snapshotIndex
+	if m > 0 {
+		if err := n.storage.TruncatePrefix(m); err != nil {
+			n.haltLocked(err)
+			return
+		}
+		n.log = n.log[m:]
+	}
+	n.snapshotIndex = target
+	n.snapshotTerm = term
+	n.snapshotData = data
+}
+
+func (n *Node) entryTermLocked(index uint64) (uint64, bool) {
+	if index == 0 || index > n.lastIndexLocked() {
+		return 0, false
+	}
+	if index == n.snapshotIndex {
+		return n.snapshotTerm, true
+	}
+	pos := index - n.snapshotIndex - 1
+	return n.log[pos].Term, true
+}
+
+func (n *Node) SnapshotIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.snapshotIndex
 }

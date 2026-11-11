@@ -28,6 +28,14 @@ type FileStorage struct {
 	log *os.File
 }
 
+type snapshotData struct {
+	index uint64
+	term  uint64
+	data  []byte
+}
+
+const snapshotFileName = "raft.snap"
+
 func OpenFileStorage(dir string) (*FileStorage, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -122,6 +130,150 @@ func encodeFrame(entry Entry) []byte {
 	checksum := crc32.ChecksumIEEE(frame[:headerSize+len(entry.Command)])
 	binary.LittleEndian.PutUint32(frame[headerSize+len(entry.Command):], checksum)
 	return frame
+}
+
+type SnapshotRecord struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
+
+func (s *FileStorage) LoadSnapshot() (*SnapshotRecord, error) {
+	body, err := os.ReadFile(filepath.Join(s.dir, snapshotFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(body)) < 4+8+8+4+sha256.Size {
+		return nil, errors.New("raft.snap is too small")
+	}
+	if string(body[:4]) != "snap" {
+		return nil, errors.New("raft.snap has invalid magic")
+	}
+	index := binary.LittleEndian.Uint64(body[4:12])
+	term := binary.LittleEndian.Uint64(body[12:20])
+	length := uint64(binary.LittleEndian.Uint32(body[20:24]))
+	end := uint64(24) + length
+	if end+4+sha256.Size > uint64(len(body)) {
+		return nil, errors.New("raft.snap declares an oversized payload")
+	}
+	payload := body[24 : 24+length]
+	crc := binary.LittleEndian.Uint32(body[24+length : 24+length+4])
+	if crc32.ChecksumIEEE(body[:24+length]) != crc {
+		return nil, errors.New("raft.snap has a bad checksum")
+	}
+	digest := sha256.Sum256(body[:24+length+4])
+	if !bytes.Equal(body[24+length+4:], digest[:]) {
+		return nil, errors.New("raft.snap digest mismatch")
+	}
+	return &SnapshotRecord{
+		Index: index,
+		Term:  term,
+		Data:  append([]byte(nil), payload...),
+	}, nil
+}
+
+func (s *FileStorage) WriteSnapshot(record SnapshotRecord) error {
+	hdr := make([]byte, 24)
+	copy(hdr[:4], "snap")
+	binary.LittleEndian.PutUint64(hdr[4:12], record.Index)
+	binary.LittleEndian.PutUint64(hdr[12:20], record.Term)
+	binary.LittleEndian.PutUint32(hdr[20:24], uint32(len(record.Data)))
+	frame := append([]byte{}, hdr...)
+	frame = append(frame, record.Data...)
+	crc := crc32.ChecksumIEEE(frame)
+
+	crcBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(crcBytes, crc)
+	frame = append(frame, crcBytes...)
+	digest := sha256.Sum256(frame)
+	frame = append(frame, digest[:]...)
+	final := filepath.Join(s.dir, snapshotFileName)
+	stage := filepath.Join(s.dir, snapshotFileName+".stage")
+	file, err := os.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(frame); err != nil {
+		file.Close()
+		os.Remove(stage)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(stage)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(stage)
+		return err
+	}
+	if err := os.Rename(stage, final); err != nil {
+		return err
+	}
+	return syncDir(s.dir)
+}
+
+func (s *FileStorage) TruncatePrefix(count uint64) error {
+	if count == 0 {
+		return nil
+	}
+	current, err := s.Load()
+	if err != nil {
+		return err
+	}
+	if uint64(len(current)) <= count {
+		s.log.Close()
+		if err := os.Truncate(filepath.Join(s.dir, logFileName), 0); err != nil {
+			return fmt.Errorf("truncate raft log prefix: %w", err)
+		}
+		file, err := os.OpenFile(filepath.Join(s.dir, logFileName), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			return err
+		}
+		s.log = file
+		if err := syncDir(s.dir); err != nil {
+			return err
+		}
+		return nil
+	}
+	kept := current[count:]
+	tmp := filepath.Join(s.dir, logFileName+".tmp")
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	for _, entry := range kept {
+		if _, err := file.Write(encodeFrame(entry)); err != nil {
+			file.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(s.dir, logFileName)); err != nil {
+		return err
+	}
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
+	s.log.Close()
+	log, err := os.OpenFile(filepath.Join(s.dir, logFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	s.log = log
+	return nil
 }
 
 func (s *FileStorage) Load() ([]Entry, error) {
@@ -255,6 +407,28 @@ type MemoryStorage struct {
 	voted int
 	meta  bool
 	lo    []Entry
+	snap  *snapshotData
+}
+
+func (m *MemoryStorage) LoadSnapshot() (*SnapshotRecord, error) {
+	if m.snap == nil {
+		return nil, nil
+	}
+	return &SnapshotRecord{Index: m.snap.index, Term: m.snap.term, Data: append([]byte(nil), m.snap.data...)}, nil
+}
+
+func (m *MemoryStorage) WriteSnapshot(record SnapshotRecord) error {
+	m.snap = &snapshotData{index: record.Index, term: record.Term, data: append([]byte(nil), record.Data...)}
+	return nil
+}
+
+func (m *MemoryStorage) TruncatePrefix(count uint64) error {
+	if count >= uint64(len(m.lo)) {
+		m.lo = nil
+		return nil
+	}
+	m.lo = m.lo[count:]
+	return nil
 }
 
 func (m *MemoryStorage) LoadMeta() (uint64, int, error) {
