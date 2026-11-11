@@ -476,6 +476,20 @@ func (n *Node) broadcastAppendEntriesLocked() {
 	if n.role != Leader {
 		return
 	}
+	singleVoter := true
+	for i, peer := range n.peers {
+		if peer != nil && i != n.cfg.Self {
+			singleVoter = false
+			break
+		}
+	}
+	if singleVoter {
+		if last := n.lastIndexLocked(); last > n.commitIndex {
+			n.commitIndex = last
+			n.applyCommittedLocked()
+		}
+		return
+	}
 	argsList := make([]AppendEntriesArgs, len(n.peers))
 	for i, peer := range n.peers {
 		if peer == nil || i == n.cfg.Self {
@@ -629,6 +643,9 @@ func (n *Node) startElectionLocked() {
 		n.mu.Unlock()
 	}
 	n.mu.Lock()
+	if n.role == Candidate && votes >= n.quorum() {
+		n.becomeLeaderLocked()
+	}
 }
 
 func (n *Node) becomeLeaderLocked() {

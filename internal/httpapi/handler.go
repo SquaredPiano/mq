@@ -243,6 +243,13 @@ func (a *API) authenticateAdmin(next http.Handler) http.Handler {
 }
 
 func (a *API) publish(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/publish"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if a.readOnly {
 		writeError(w, http.StatusMethodNotAllowed, "follower nodes do not accept client publishes")
 		return
@@ -279,6 +286,13 @@ func (a *API) publish(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) publishBatch(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/publish-batch"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if a.readOnly {
 		writeError(w, http.StatusMethodNotAllowed, "follower nodes do not accept client publishes")
 		return
@@ -379,6 +393,13 @@ func (a *API) fetchGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) commit(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/groups/commit"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if a.readOnly {
 		writeError(w, http.StatusMethodNotAllowed, "follower nodes do not accept consumer commits")
 		return
