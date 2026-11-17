@@ -40,6 +40,10 @@ func run() (runErr error) {
 		"wal-segment-bytes", broker.DefaultWALSegmentBytes,
 		"maximum size of a WAL segment (minimum 4 MiB)",
 	)
+	partitionCount := flag.Int(
+		"partitions", 1,
+		"number of partitions each topic is sharded into at start",
+	)
 	snapshotInterval := flag.Int64(
 		"snapshot-interval-bytes", 64<<20,
 		"bytes of undeliverable WAL growth after the shared snapshot before the leader takes another checkpoint; zero stops automatic checkpointing",
@@ -69,6 +73,7 @@ func run() (runErr error) {
 	store, err := broker.OpenWithOptions(*dataDir, broker.OpenOptions{
 		GroupCommitWindow: *groupCommitWindow,
 		WALSegmentBytes:   *walSegmentBytes,
+		PartitionCount:    *partitionCount,
 	})
 	if err != nil {
 		return fmt.Errorf("open broker: %w", err)
@@ -140,7 +145,7 @@ func run() (runErr error) {
 			return errors.New("-raft-self is outside -raft-peers")
 		}
 		var err error
-		cluster, err = mqcluster.Open(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond)
+		cluster, err = mqcluster.OpenWithPartitions(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond, *partitionCount)
 		if err != nil {
 			return fmt.Errorf("open cluster node: %w", err)
 		}

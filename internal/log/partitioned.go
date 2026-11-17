@@ -72,6 +72,7 @@ func (p *PartitionedLog) AppendRecord(record Record) error {
 	if record.Offset != endOffset {
 		return fmt.Errorf("%w: got %d, want %d", ErrOffsetMismatch, record.Offset, endOffset)
 	}
+	record.Partition = uint8(p.AssignPartition(record.Key))
 	p.records = append(p.records, record)
 	return nil
 }
@@ -80,11 +81,12 @@ func (p *PartitionedLog) AppendRecords(records []Record) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	endOffset := p.startOffset + uint64(len(p.records))
-	for i, record := range records {
+	for i := range records {
 		want := endOffset + uint64(i)
-		if record.Offset != want {
-			return fmt.Errorf("%w: got %d, want %d", ErrOffsetMismatch, record.Offset, want)
+		if records[i].Offset != want {
+			return fmt.Errorf("%w: got %d, want %d", ErrOffsetMismatch, records[i].Offset, want)
 		}
+		records[i].Partition = uint8(p.AssignPartition(records[i].Key))
 	}
 	p.records = append(p.records, records...)
 	return nil
@@ -163,19 +165,9 @@ func (p *PartitionedLog) Snapshot() (startOffset, endOffset uint64, records []Re
 	return startOffset, endOffset, records
 }
 
-func (p *PartitionedLog) Restore(startOffset, endOffset uint64, records []Record) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	clear(p.shards)
-	p.shards = make([]*Log, p.partitionCount)
-	p.records = make([]Record, 0, len(records))
-	p.startOffset = startOffset
-	return p.AppendRecords(records)
-}
-
 func RestorePartitionedOwned(startOffset, endOffset uint64, records []Record, partitions int) (*PartitionedLog, error) {
-	if err := validateRestoredRange(startOffset, endOffset, records); err != nil {
-		return nil, err
+	if endOffset < startOffset || uint64(len(records)) != endOffset-startOffset {
+		return nil, fmt.Errorf("snapshot log range does not match its record count")
 	}
 	if partitions < 1 {
 		partitions = 1

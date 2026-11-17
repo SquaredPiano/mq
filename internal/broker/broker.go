@@ -154,6 +154,13 @@ func New() *Broker {
 	return &Broker{partitionCount: 1}
 }
 
+func NewWithPartitions(n int) *Broker {
+	if n < 1 {
+		n = 1
+	}
+	return &Broker{partitionCount: n}
+}
+
 func Open(dataDir string) (*Broker, error) {
 	return OpenWithOptions(dataDir, OpenOptions{
 		GroupCommitWindow: DefaultGroupCommitWindow,
