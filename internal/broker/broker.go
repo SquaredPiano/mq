@@ -1242,6 +1242,10 @@ func finishPublishGroup(requests []*publishRequest, groupErr error) {
 }
 
 func (b *Broker) Fetch(topic string, offset uint64, limit int) ([]messageLog.Record, error) {
+	return b.FetchWithPartitions(topic, offset, limit, nil)
+}
+
+func (b *Broker) FetchWithPartitions(topic string, offset uint64, limit int, partitions []int) ([]messageLog.Record, error) {
 	if !validName(topic) {
 		return nil, ErrInvalidTopic
 	}
@@ -1257,7 +1261,26 @@ func (b *Broker) Fetch(topic string, offset uint64, limit int) ([]messageLog.Rec
 		return nil, fmt.Errorf("%w: %q", ErrTopicNotFound, topic)
 	}
 
-	return topicLog.Read(offset, limit)
+	base, err := topicLog.Read(offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	if partitions == nil {
+		return base, nil
+	}
+	var wanted [256]bool
+	for _, p := range partitions {
+		if p >= 0 && p < len(wanted) {
+			wanted[p] = true
+		}
+	}
+	filtered := make([]messageLog.Record, 0, len(base))
+	for _, r := range base {
+		if wanted[r.Partition] {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
 }
 
 func (b *Broker) FetchGroup(group, topic string, limit int) ([]messageLog.Record, error) {

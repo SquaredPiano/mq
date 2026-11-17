@@ -57,9 +57,10 @@ type publishBatchRequest struct {
 }
 
 type fetchRequest struct {
-	Topic  string `json:"topic"`
-	Offset uint64 `json:"offset"`
-	Limit  int    `json:"limit"`
+	Topic      string `json:"topic"`
+	Offset     uint64 `json:"offset"`
+	Limit      int    `json:"limit"`
+	Partitions []int  `json:"partitions,omitempty"`
 }
 
 type groupFetchRequest struct {
@@ -369,7 +370,7 @@ func (a *API) fetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := a.broker.Fetch(request.Topic, request.Offset, request.Limit)
+	records, err := a.broker.FetchWithPartitions(request.Topic, request.Offset, request.Limit, request.Partitions)
 	if err != nil {
 		writeBrokerError(w, err)
 		return

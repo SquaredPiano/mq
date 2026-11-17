@@ -33,7 +33,7 @@ func (p *PartitionedLog) AssignPartition(key []byte) int {
 		return 0
 	}
 	h := fnv.New64a()
-	h.Write(key)
+	_, _ = h.Write(key)
 	return int(h.Sum64() % uint64(p.partitionCount))
 }
 
