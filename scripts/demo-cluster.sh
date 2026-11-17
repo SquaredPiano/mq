@@ -34,7 +34,11 @@ done
 sleep 2
 
 get_role() {
-  curl -sS -H "X-Raft-Token: $token_raft" "http://127.0.0.1:$1/raft/role" | python3 -c 'import json,sys; print(json.load(sys.stdin)["role"])'
+  local role
+  role=$(curl -sS -m 2 -H "X-Raft-Token: $token_raft" "http://127.0.0.1:$1/raft/role" 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["role"])
+except Exception: print("")' 2>/dev/null) || true
+  echo "$role"
 }
 
 query_leader() {
@@ -55,7 +59,7 @@ echo "first leader = $LEADER_PORT"
 
 for rawkey in alpha bravo charlie delta; do
   body=$(python3 -c "import json,base64;print(json.dumps({'topic':'events','key':base64.b64encode('$rawkey'.encode()).decode(),'value':base64.b64encode(('hello-'+'$rawkey').encode()).decode()}))")
-  curl -sS -X POST "http://127.0.0.1:$LEADER_PORT/v1/publish" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d "$body"
+  curl -sS --location-trusted -L -X POST "http://127.0.0.1:$LEADER_PORT/v1/publish" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d "$body"
   echo
 done
 
@@ -68,6 +72,15 @@ echo "new leader = $NEW_LEADER"
 
 echo "fetch after leader kill:"
 curl -sS -X POST "http://127.0.0.1:$NEW_LEADER/v1/fetch" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d '{"topic":"events","offset":0,"limit":10}'
+echo
+echo "join members to partitioned group:"
+curl -sS -X POST "http://127.0.0.1:$NEW_LEADER/v1/groups/join" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d '{"group":"workers","topic":"events"}'
+echo
+curl -sS -X POST "http://127.0.0.1:$NEW_LEADER/v1/groups/join" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d '{"group":"workers","topic":"events"}'
+echo
+echo "fetch partitions [0,1]:"
+curl -sS -X POST "http://127.0.0.1:$NEW_LEADER/v1/fetch" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d '{"topic":"events","offset":0,"limit":10,"partitions":[0,1]}'
+echo
 
 for i in 0 1 2; do
   kill "$(cat /tmp/mq-demo-$i.pid)" 2>/dev/null || true
