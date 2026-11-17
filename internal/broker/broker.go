@@ -454,6 +454,16 @@ func (b *Broker) SetReplicator(replicate func() error) {
 	b.writeMu.Unlock()
 }
 
+func (b *Broker) PartitionCount(topic string) int {
+	b.mu.RLock()
+	topicLog, exists := b.topics[topic]
+	b.mu.RUnlock()
+	if exists {
+		return topicLog.Partitions()
+	}
+	return b.partitionCount
+}
+
 func (b *Broker) currentWAL() *wal.WAL {
 	b.walMu.RLock()
 	defer b.walMu.RUnlock()
@@ -1254,7 +1264,7 @@ func (b *Broker) FetchGroup(group, topic string, limit int) ([]messageLog.Record
 	return b.FetchGroupWithPartitions(group, topic, limit, nil)
 }
 
-func (b *Broker) FetchGroupWithPartitions(group, topic string, limit int, partitions []uint8) ([]messageLog.Record, error) {
+func (b *Broker) FetchGroupWithPartitions(group, topic string, limit int, partitions []int) ([]messageLog.Record, error) {
 	if !validName(group) {
 		return nil, ErrInvalidGroup
 	}
@@ -1290,7 +1300,9 @@ func (b *Broker) FetchGroupWithPartitions(group, topic string, limit int, partit
 	}
 	var wanted [256]bool
 	for _, p := range partitions {
-		wanted[p] = true
+		if p >= 0 && p < len(wanted) {
+			wanted[p] = true
+		}
 	}
 	filtered := make([]messageLog.Record, 0, len(base))
 	for _, r := range base {

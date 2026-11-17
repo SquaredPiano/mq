@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"mq/internal/broker"
+	"mq/internal/groupsync"
 	messageLog "mq/internal/log"
 )
 
@@ -26,6 +27,7 @@ const (
 
 type API struct {
 	broker                     *broker.Broker
+	groupRegistry              *groupsync.Registry
 	readOnly                   bool
 	leaderResolver             LeaderResolver
 	selfURL                    string
@@ -61,10 +63,10 @@ type fetchRequest struct {
 }
 
 type groupFetchRequest struct {
-	Group      string  `json:"group"`
-	Topic      string  `json:"topic"`
-	Limit      int     `json:"limit"`
-	Partitions []uint8 `json:"partitions,omitempty"`
+	Group      string `json:"group"`
+	Topic      string `json:"topic"`
+	Limit      int    `json:"limit"`
+	Partitions []int  `json:"partitions,omitempty"`
 }
 
 type commitRequest struct {
@@ -79,11 +81,15 @@ type retentionRequest struct {
 }
 
 type response struct {
-	OK      bool                 `json:"ok"`
-	Error   string               `json:"error,omitempty"`
-	Offset  *uint64              `json:"offset,omitempty"`
-	Offsets []uint64             `json:"offsets,omitempty"`
-	Records *[]messageLog.Record `json:"records,omitempty"`
+	OK         bool                 `json:"ok"`
+	Error      string               `json:"error,omitempty"`
+	Offset     *uint64              `json:"offset,omitempty"`
+	Offsets    []uint64             `json:"offsets,omitempty"`
+	Records    *[]messageLog.Record `json:"records,omitempty"`
+	Group      *string              `json:"group,omitempty"`
+	MemberID   *string              `json:"member_id,omitempty"`
+	Partitions []int                `json:"partitions,omitempty"`
+	Members    []groupsync.Member   `json:"members,omitempty"`
 }
 
 type snapshotResponse struct {
@@ -97,7 +103,7 @@ func NewHandler(b *broker.Broker) http.Handler {
 }
 
 func NewAuthenticatedHandler(b *broker.Broker, clientToken string) http.Handler {
-	a := &API{broker: b, clientToken: clientToken}
+	a := &API{broker: b, groupRegistry: groupsync.New(), clientToken: clientToken}
 	return a.handler()
 }
 
@@ -105,7 +111,7 @@ func NewAuthenticatedHandlerWithAdmin(b *broker.Broker, clientToken, adminToken 
 	if adminToken != "" && adminToken == clientToken {
 		return nil, errors.New("client and admin tokens must be different")
 	}
-	a := &API{broker: b, clientToken: clientToken, adminToken: adminToken}
+	a := &API{broker: b, groupRegistry: groupsync.New(), clientToken: clientToken, adminToken: adminToken}
 	return a.handler(), nil
 }
 
@@ -123,7 +129,7 @@ func NewAuthenticatedHandlerWithLeader(b *broker.Broker, clientToken, adminToken
 	if selfURL == "" {
 		return nil, errors.New("self URL is required in cluster mode")
 	}
-	a := &API{broker: b, clientToken: clientToken, adminToken: adminToken, leaderResolver: resolve, selfURL: selfURL}
+	a := &API{broker: b, groupRegistry: groupsync.New(), clientToken: clientToken, adminToken: adminToken, leaderResolver: resolve, selfURL: selfURL}
 	return a.handler(), nil
 }
 
@@ -146,6 +152,7 @@ func NewAuthenticatedLeaderHandlerWithAdmin(b *broker.Broker, replicationToken, 
 	}
 	a := &API{
 		broker:                     b,
+		groupRegistry:              groupsync.New(),
 		requireRequestID:           true,
 		clientToken:                clientToken,
 		adminToken:                 adminToken,
@@ -187,6 +194,10 @@ func (a *API) handler() http.Handler {
 	mux.Handle("/v1/fetch", a.authenticateClient(http.HandlerFunc(a.fetch)))
 	mux.Handle("/v1/groups/fetch", a.authenticateClient(http.HandlerFunc(a.fetchGroup)))
 	mux.Handle("/v1/groups/commit", a.authenticateClient(http.HandlerFunc(a.commit)))
+	mux.Handle("/v1/groups/join", a.authenticateClient(http.HandlerFunc(a.joinGroup)))
+	mux.Handle("/v1/groups/heartbeat", a.authenticateClient(http.HandlerFunc(a.heartbeatGroup)))
+	mux.Handle("/v1/groups/leave", a.authenticateClient(http.HandlerFunc(a.leaveGroup)))
+	mux.Handle("/v1/groups/members", a.authenticateClient(http.HandlerFunc(a.listGroup)))
 	if a.adminToken != "" {
 		mux.Handle("/v1/topics/retain", a.authenticateAdmin(http.HandlerFunc(a.retain)))
 		mux.Handle("/v1/snapshot", a.authenticateAdmin(http.HandlerFunc(a.snapshot)))
@@ -622,6 +633,83 @@ func (a *API) replicationSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) joinGroup(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	var request struct {
+		Group string `json:"group"`
+		Topic string `json:"topic"`
+	}
+	if !decodeRequest(w, r, &request) {
+		return
+	}
+	partitions := a.broker.PartitionCount(request.Topic)
+	member, err := a.groupRegistry.Join(request.Group, request.Topic, uint8(partitions))
+	if err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response{OK: true, Group: &member.Group, MemberID: &member.ID, Partitions: member.Assigned})
+}
+
+func (a *API) heartbeatGroup(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	var request struct {
+		Group    string `json:"group"`
+		Topic    string `json:"topic"`
+		MemberID string `json:"member_id"`
+	}
+	if !decodeRequest(w, r, &request) {
+		return
+	}
+	partitions := a.broker.PartitionCount(request.Topic)
+	member, err := a.groupRegistry.Heartbeat(request.Group, request.Topic, request.MemberID, uint8(partitions))
+	if err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response{OK: true, Group: &member.Group, MemberID: &member.ID, Partitions: member.Assigned})
+}
+
+func (a *API) leaveGroup(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	var request struct {
+		Group    string `json:"group"`
+		Topic    string `json:"topic"`
+		MemberID string `json:"member_id"`
+	}
+	if !decodeRequest(w, r, &request) {
+		return
+	}
+	partitions := a.broker.PartitionCount(request.Topic)
+	if err := a.groupRegistry.Leave(request.Group, request.Topic, request.MemberID, uint8(partitions)); err != nil {
+		writeBrokerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response{OK: true})
+}
+
+func (a *API) listGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method must be GET")
+		return
+	}
+	group := r.URL.Query().Get("group")
+	topic := r.URL.Query().Get("topic")
+	if group == "" || topic == "" {
+		writeError(w, http.StatusBadRequest, "group and topic are required")
+		return
+	}
+	members := a.groupRegistry.List(group, topic)
+	writeJSON(w, http.StatusOK, response{OK: true, Members: members})
 }
 
 func (a *API) authorizeReplication(w http.ResponseWriter, r *http.Request) bool {
