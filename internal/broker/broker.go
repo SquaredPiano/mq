@@ -1251,6 +1251,10 @@ func (b *Broker) Fetch(topic string, offset uint64, limit int) ([]messageLog.Rec
 }
 
 func (b *Broker) FetchGroup(group, topic string, limit int) ([]messageLog.Record, error) {
+	return b.FetchGroupWithPartitions(group, topic, limit, nil)
+}
+
+func (b *Broker) FetchGroupWithPartitions(group, topic string, limit int, partitions []uint8) ([]messageLog.Record, error) {
 	if !validName(group) {
 		return nil, ErrInvalidGroup
 	}
@@ -1271,10 +1275,30 @@ func (b *Broker) FetchGroup(group, topic string, limit int) ([]messageLog.Record
 		return nil, fmt.Errorf("%w: %q", ErrTopicNotFound, topic)
 	}
 
+	var base []messageLog.Record
+	var err error
 	if !hasCommit {
-		return topicLog.ReadFromStart(limit)
+		base, err = topicLog.ReadFromStart(limit)
+	} else {
+		base, err = topicLog.Read(nextOffset, limit)
 	}
-	return topicLog.Read(nextOffset, limit)
+	if err != nil {
+		return nil, err
+	}
+	if partitions == nil {
+		return base, nil
+	}
+	var wanted [256]bool
+	for _, p := range partitions {
+		wanted[p] = true
+	}
+	filtered := make([]messageLog.Record, 0, len(base))
+	for _, r := range base {
+		if wanted[r.Partition] {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
 }
 
 func (b *Broker) Commit(group, topic string, nextOffset uint64) error {

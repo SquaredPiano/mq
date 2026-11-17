@@ -61,9 +61,10 @@ type fetchRequest struct {
 }
 
 type groupFetchRequest struct {
-	Group string `json:"group"`
-	Topic string `json:"topic"`
-	Limit int    `json:"limit"`
+	Group      string  `json:"group"`
+	Topic      string  `json:"topic"`
+	Limit      int     `json:"limit"`
+	Partitions []uint8 `json:"partitions,omitempty"`
 }
 
 type commitRequest struct {
@@ -381,7 +382,7 @@ func (a *API) fetchGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := a.broker.FetchGroup(request.Group, request.Topic, request.Limit)
+	records, err := a.broker.FetchGroupWithPartitions(request.Group, request.Topic, request.Limit, request.Partitions)
 	if err != nil {
 		writeBrokerError(w, err)
 		return
