@@ -1,8 +1,8 @@
 # mq
 
-A small, durable message broker written in Go. Published records live on disk in a write-ahead log. A single-node cluster survives a restart; a follower keeps a byte replica of the leader's log; a three-node cluster elects a leader and commits every write to a majority.
+A small distributed message broker written in Go. Topics are split across multiple partitions by key hash. Records live on disk in a write-ahead log. Standalone mode restarts to a consistent state; follower mode anchors a second copy; three-node cluster runs raft with automatic leader election and majority commit.
 
-It speaks HTTP and JSON. It is not Kafka. It does what this README describes and nothing more.
+Speaks HTTP and JSON. Consumers in a group join to receive balanced partition assignments.
 
 ## Run it
 
@@ -10,18 +10,28 @@ It speaks HTTP and JSON. It is not Kafka. It does what this README describes and
 go run ./cmd/mqd -listen 127.0.0.1:8080
 ```
 
+Or with several partitions per topic:
+
+```sh
+go run ./cmd/mqd -listen 127.0.0.1:8080 -partitions 6
+```
+
 Data goes in `./mq-data`. Pass `-data` to change that. The server is plain HTTP on localhost; non-loopback listeners require TLS and a client token.
 
 ## Publish and read
 
-Every call is `POST` with one JSON object. `key` and `value` are base64.
+Every call is `POST` with one JSON object. `key` and `value` are base64. Records are stored in a partition selected by the key's hash.
 
 | Endpoint | What you send | What it does |
 | --- | --- | --- |
-| `/v1/publish` | `topic`, `key`, `value`, optional `request_id` | Append one record and return its `offset`. |
+| `/v1/publish` | `topic`, `key`, `value`, optional `request_id` | Append one record to the partition that matches the key. |
 | `/v1/publish-batch` | `topic`, `messages`, optional `request_id` | Append up to 32 records in one fsync. |
-| `/v1/fetch` | `topic`, `offset`, `limit` | Read records from an offset. |
+| `/v1/fetch` | `topic`, `offset`, `limit` | Read records from an offset. Pass `partitions` to get only specific partitions. |
 | `/v1/groups/fetch` | `group`, `topic`, `limit` | Read records from the group's committed offset. |
+| `/v1/groups/join` | `group`, `topic` | Join a group, receive member id and assigned partitions. |
+| `/v1/groups/heartbeat` | `group`, `topic`, `member_id` | Refresh the member's lease. |
+| `/v1/groups/leave` | `group`, `topic`, `member_id` | Resign and trigger a partition reassignment across remaining members. |
+| `/v1/groups/members` | query `group=...&topic=...` | List active members and their partition assignments. |
 | `/v1/groups/commit` | `group`, `topic`, `next_offset` | Commit the offset the group should read next. |
 | `/v1/topics/retain` | `topic`, `start_offset` | Move a topic's start offset. Admin token required. |
 | `/v1/snapshot` | empty body | Write a recovery snapshot. Admin token required. |
@@ -30,15 +40,7 @@ Request ids give at-least-once delivery: a retry with the same id returns the or
 
 Messages are at most 256 KiB key+value. Batches are at most 32 records. Topic names, group names, and request ids are at most 255 bytes.
 
-Consumer groups track their own offsets. If the process dies before a commit lands, the next fetch returns the record again — so delivery is at least once.
-
 ## Run a cluster
-
-Standalone:
-
-```sh
-go run ./cmd/mqd -listen 127.0.0.1:8080
-```
 
 Primary-backup replication (follower first):
 
@@ -70,7 +72,8 @@ Every write is acknowledged only after a majority has committed it.
 ## Limits
 
 - At-least-once delivery; not exactly-once.
-- Topics are single-partition. Consumer groups cannot share out work.
+- Topics are multiple partitions but all partitions share one WAL file per topic (no per-partition WAL yet).
+- Consumer group membership is in-memory; a restart of all members resets assignments.
 - Cluster membership is fixed at start; no member add/remove.
 - Snapshot restore is full broker state; request-id state is preserved.
 - Standalone (single-node) is lean and fast. Follower mode pairs durability with a minor latency cost; cluster mode gives automatic failover but is the slowest path — every write is a majority agreement across fsyncs.
