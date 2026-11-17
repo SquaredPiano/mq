@@ -53,8 +53,9 @@ query_leader() {
 LEADER_PORT=$(query_leader)
 echo "first leader = $LEADER_PORT"
 
-for i in 1 2 3; do
-  curl -sS -X POST "http://127.0.0.1:$LEADER_PORT/v1/publish" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d '{"topic":"events","key":"","value":"aGVsbG8="}'
+for rawkey in alpha bravo charlie delta; do
+  body=$(python3 -c "import json,base64;print(json.dumps({'topic':'events','key':base64.b64encode('$rawkey'.encode()).decode(),'value':base64.b64encode(('hello-'+'$rawkey').encode()).decode()}))")
+  curl -sS -X POST "http://127.0.0.1:$LEADER_PORT/v1/publish" -H 'Content-Type: application/json' -H "Authorization: Bearer $token_client" -d "$body"
   echo
 done
 
