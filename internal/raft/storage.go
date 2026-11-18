@@ -13,15 +13,189 @@ import (
 )
 
 const (
-	metaFileName = "raft.meta"
-	logFileName  = "raft.log"
-	magic        = uint32(0x3BC2A94F)
-	headerSize   = 16
-	metaMagic    = uint32(0xBE516C01)
-	metaSize     = metaMagicSize
+	metaFileName    = "raft.meta"
+	logFileName      = "raft.log"
+	membersFileName  = "raft.members"
+	magic            = uint32(0x3BC2A94F)
+	headerSize       = 16
+	metaMagic        = uint32(0xBE516C01)
+	metaSize         = metaMagicSize
+	membersMagic     = uint32(0x4D454D52)
+	membersStageName  = "raft.members.stage"
 )
 
 const metaMagicSize = 4 + 8 + 4 + sha256.Size
+
+type MembershipSnap struct {
+	Peers []PeerSpec `json:"peers"`
+	Voter []bool     `json:"voter"`
+}
+
+func (s *FileStorage) LoadMembershipSnap() (*MembershipSnap, error) {
+	path := filepath.Join(s.dir, membersFileName)
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(body)) < 4+8+4+sha256.Size {
+		return nil, errors.New("raft.members is too small")
+	}
+	if binary.LittleEndian.Uint32(body[:4]) != membersMagic {
+		return nil, errors.New("raft.members has invalid magic")
+	}
+	length := uint64(binary.LittleEndian.Uint64(body[4:12]))
+	end := uint64(12) + length
+	if end+sha256.Size > uint64(len(body)) {
+		return nil, errors.New("raft.members has invalid length")
+	}
+	payload := body[12:end]
+	digest := sha256.Sum256(payload)
+	if !bytes.Equal(body[end:], digest[:]) {
+		return nil, errors.New("raft.members checksum mismatch")
+	}
+	var snap MembershipSnap
+	if _, err := snap.UnmarshalBinary(payload); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+func (s *FileStorage) WriteMembershipSnap(snap MembershipSnap) error {
+	payload, err := snap.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	body := make([]byte, 0, 4+8+len(payload)+sha256.Size)
+	hdr := make([]byte, 4)
+	binary.LittleEndian.PutUint32(hdr, membersMagic)
+	body = append(body, hdr...)
+	var lengthBytes [8]byte
+	binary.LittleEndian.PutUint64(lengthBytes[:], uint64(len(payload)))
+	body = append(body, lengthBytes[:]...)
+	body = append(body, payload...)
+	digest := sha256.Sum256(body)
+	body = append(body, digest[:]...)
+
+	stage := filepath.Join(s.dir, membersStageName)
+	final := filepath.Join(s.dir, membersFileName)
+	file, err := os.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		_ = os.Remove(stage)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(stage)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(stage)
+		return err
+	}
+	if err := os.Rename(stage, final); err != nil {
+		return err
+	}
+	return syncDir(s.dir)
+}
+
+func (s MembershipSnap) MarshalBinary() ([]byte, error) {
+	var buf []byte
+	buf = appendInt16(buf, int16(len(s.Peers)))
+	for _, peer := range s.Peers {
+		buf = appendInt16(buf, int16(peer.Index))
+		buf = appendString(buf, peer.URL)
+	}
+	buf = appendInt16(buf, int16(len(s.Voter)))
+	for _, vot := range s.Voter {
+		if vot {
+			buf = append(buf, 1)
+		} else {
+			buf = append(buf, 0)
+		}
+	}
+	return buf, nil
+}
+
+func (s *MembershipSnap) UnmarshalBinary(body []byte) (int, error) {
+	s.Peers = nil
+	s.Voter = nil
+	n, err := readInt16(body, 0)
+	if err != nil {
+		return 0, err
+	}
+	pos := 2
+	for i := int16(0); i < n; i++ {
+		peer := PeerSpec{}
+		v, err := readInt16(body, pos)
+		if err != nil {
+			return 0, err
+		}
+		peer.Index = int(v)
+		pos += 2
+		peer.URL, pos, err = readString(body, pos)
+		if err != nil {
+			return 0, err
+		}
+		s.Peers = append(s.Peers, peer)
+	}
+	n, err = readInt16(body, pos)
+	if err != nil {
+		return 0, err
+	}
+	pos += 2
+	for i := int16(0); i < n; i++ {
+		if body[pos] != 0 && body[pos] != 1 {
+			return 0, errors.New("invalid voter bit")
+		}
+		s.Voter = append(s.Voter, body[pos] == 1)
+		pos++
+	}
+	return pos, nil
+}
+
+func appendInt16(buf []byte, v int16) []byte {
+	var b [2]byte
+	binary.LittleEndian.PutUint16(b[:], uint16(v))
+	return append(buf, b[:]...)
+}
+
+func appendString(buf []byte, s string) []byte {
+	if s == "" {
+		return appendInt16(buf, 0)
+	}
+	buf = appendInt16(buf, int16(len(s)))
+	return append(buf, []byte(s)...)
+}
+
+func readInt16(body []byte, pos int) (int16, error) {
+	if pos+2 > len(body) {
+		return 0, errors.New("read int16 out of range")
+	}
+	return int16(binary.LittleEndian.Uint16(body[pos:pos+2])), nil
+}
+
+func readString(body []byte, pos int) (string, int, error) {
+	n, err := readInt16(body, pos)
+	if err != nil {
+		return "", pos, err
+	}
+	pos += 2
+	if n == 0 {
+		return "", pos, nil
+	}
+	if pos+int(n) > len(body) {
+		return "", pos, errors.New("read string out of range")
+	}
+	return string(body[pos:pos+int(n)]), pos + int(n), nil
+}
+
 
 type FileStorage struct {
 	dir string
@@ -403,11 +577,12 @@ func (s *FileStorage) Close() error {
 }
 
 type MemoryStorage struct {
-	term  uint64
-	voted int
-	meta  bool
-	lo    []Entry
-	snap  *snapshotData
+	term    uint64
+	voted   int
+	meta    bool
+	lo      []Entry
+	snap    *snapshotData
+	members *MembershipSnap
 }
 
 func (m *MemoryStorage) LoadSnapshot() (*SnapshotRecord, error) {
@@ -467,6 +642,21 @@ func (m *MemoryStorage) TruncateFrom(index uint64) error {
 	}
 	m.lo = m.lo[:index]
 	return nil
+}
+
+func (m *MemoryStorage) WriteMembershipSnap(snap MembershipSnap) error {
+	m.members = &snap
+	return nil
+}
+
+func (m *MemoryStorage) LoadMembershipSnap() (*MembershipSnap, error) {
+	if m.members == nil {
+		return nil, nil
+	}
+	snap := *m.members
+	snap.Peers = append([]PeerSpec(nil), snap.Peers...)
+	snap.Voter = append([]bool(nil), snap.Voter...)
+	return &snap, nil
 }
 
 func (m *MemoryStorage) Close() error {

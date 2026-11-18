@@ -262,3 +262,105 @@ func TestFollowerRedirectsFetchToLeader(t *testing.T) {
 	}
 	t.Fatal("follower did not redirect fetch within 2s")
 }
+
+func TestClusterMembershipLifecycle(t *testing.T) {
+	nodes, _, urls, _ := newTestCluster(t, 3)
+	leaderIdx := waitForLeader(t, nodes, 5*time.Second)
+
+	token := "test-raft-token"
+	learnerMux := http.NewServeMux()
+	holderLearner := &holder{mux: learnerMux}
+	learnerMux.Handle("/raft/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if holderLearner.raft == nil {
+			http.Error(w, "learner not ready", http.StatusServiceUnavailable)
+			return
+		}
+		holderLearner.raft.ServeHTTP(w, r)
+	}))
+	learnerServer := httptest.NewServer(learnerMux)
+	t.Cleanup(learnerServer.Close)
+
+	learnerURLs := append([]string(nil), urls...)
+	learnerURLs = append(learnerURLs, learnerServer.URL)
+
+	learnerDir := t.TempDir()
+	learnerNode, err := OpenWithPartitions(learnerDir, learnerURLs, 3, token, 20*time.Millisecond, 1, true)
+	if err != nil {
+		t.Fatalf("open learner: %v", err)
+	}
+	t.Cleanup(func() { _ = learnerNode.Close() })
+	holderLearner.raft = muxHandler(learnerNode.Raft, token)
+
+	time.Sleep(100 * time.Millisecond)
+	if role := learnerNode.Raft.StateRole(); role == raft.Leader {
+		t.Fatal("learner node took leadership before promotion")
+	}
+
+	mbr := nodes[leaderIdx].Raft
+	idx, err := mbr.AddNode(raft.PeerSpec{URL: learnerServer.URL})
+	if err != nil {
+		t.Fatalf("add-node: %v", err)
+	}
+	if idx != 3 {
+		t.Fatalf("add-node index = %d, want 3", idx)
+	}
+
+	memberDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(memberDeadline) {
+		specs, voters := mbr.MembershipMembers()
+		if len(specs) == 4 && specs[3].URL == learnerServer.URL && !voters[3] {
+			goto added
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("learner did not appear in members as non-voter")
+
+
+added:
+	for _, n := range nodes {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			specs, voters := n.Raft.MembershipMembers()
+			if len(specs) == 4 && voters[3] == false {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	idx, err = mbr.PromoteNode(raft.PeerSpec{Index: 3})
+	if err != nil {
+		t.Fatalf("promote-node: %v", err)
+	}
+	if idx != 3 {
+		t.Fatalf("promote-node index = %d, want 3", idx)
+	}
+
+	promoteDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(promoteDeadline) {
+		_, voters := mbr.MembershipMembers()
+		if len(voters) >= 4 && voters[3] {
+			goto promoted
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("learner was not promoted to voter")
+
+	promoted:
+	_, err = mbr.RemoveNode(raft.PeerSpec{Index: 3})
+	if err != nil {
+		t.Fatalf("remove-node: %v", err)
+	}
+
+	removeDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(removeDeadline) {
+		specs, voters := mbr.MembershipMembers()
+		if len(specs) >= 4 && specs[3].URL == "" && len(voters) >= 4 && !voters[3] {
+			goto removed
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("removed node still present as voter in members")
+
+	removed:
+}

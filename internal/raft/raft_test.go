@@ -133,6 +133,8 @@ type flakyPeer struct {
 	drop bool
 }
 
+func (p *flakyPeer) PeerURL() string { return "" }
+
 func (p *flakyPeer) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	if p.drop {
 		return RequestVoteReply{Term: args.Term, VoteGranted: false}

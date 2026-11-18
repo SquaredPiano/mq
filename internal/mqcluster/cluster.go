@@ -21,10 +21,10 @@ type Node struct {
 }
 
 func Open(dir string, peers []string, selfIndex int, raftToken string, heartbeat time.Duration) (*Node, error) {
-	return OpenWithPartitions(dir, peers, selfIndex, raftToken, heartbeat, 1)
+	return OpenWithPartitions(dir, peers, selfIndex, raftToken, heartbeat, 1, false)
 }
 
-func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken string, heartbeat time.Duration, partitions int) (*Node, error) {
+func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken string, heartbeat time.Duration, partitions int, learner bool) (*Node, error) {
 	if len(peers) == 0 {
 		return nil, errors.New("raft peers are required")
 	}
@@ -41,6 +41,17 @@ func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken str
 		HeartbeatTicks:   1,
 		ElectionMinTicks: 10,
 		ElectionMaxTicks: 20,
+		Learner:          learner,
+		PeerFactory: func(spec raft.PeerSpec) (raft.Peer, error) {
+			if spec.URL == "" {
+				return nil, errors.New("member peer spec is missing url")
+			}
+			return raft.HTTPPeer{
+				BaseURL: spec.URL,
+				Token:   raftToken,
+				Client:  &http.Client{Timeout: 5 * time.Second},
+			}, nil
+		},
 	}
 	for i, peerURL := range peers {
 		parsed, err := url.Parse(peerURL)

@@ -69,12 +69,50 @@ curl -H "X-Raft-Token: $MQ_RAFT_TOKEN" http://127.0.0.1:8081/raft/role
 
 Every write is acknowledged only after a majority has committed it.
 
+## Grow the cluster at runtime
+
+A fresh node joins as a non-voting learner: start it with `-raft-learner` so it waits for the cluster instead of campaigning on its own (which could otherwise disrupt the running leader).
+
+```sh
+export MQ_ADMIN_TOKEN='replace-with-a-long-random-token'
+go run ./cmd/mqd -role cluster -listen 127.0.0.1:8084 -data ./node-4-data \
+  -raft-peers http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083,http://127.0.0.1:8084 -raft-self 3 \
+  -raft-learner -raft-token "$MQ_RAFT_TOKEN" -admin-token "$MQ_ADMIN_TOKEN"
+```
+
+Ask the current leader to add it (as non-voting):
+
+```sh
+curl -X POST -H "Authorization: Bearer $MQ_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"url":"http://127.0.0.1:8084"}' http://127.0.0.1:8081/v1/admin/cluster/add-node
+```
+
+Promote it to voter once it has caught up:
+
+```sh
+curl -X POST -H "Authorization: Bearer $MQ_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"index":3}' http://127.0.0.1:8081/v1/admin/cluster/promote-node
+```
+
+Remove a node:
+
+```sh
+curl -X POST -H "Authorization: Bearer $MQ_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"index":3}' http://127.0.0.1:8081/v1/admin/cluster/remove-node
+```
+
+List current members and votes:
+
+```sh
+curl -H "Authorization: Bearer $MQ_ADMIN_TOKEN" http://127.0.0.1:8081/v1/admin/cluster/members
+```
+
 ## Limits
 
 - At-least-once delivery; not exactly-once.
 - Topics are multiple partitions but all partitions share one WAL file per topic (no per-partition WAL yet).
 - Consumer group membership is in-memory; a restart of all members resets assignments.
-- Cluster membership is fixed at start; no member add/remove.
+- Cluster membership can grow and shrink at runtime through `add-node`, `promote-node`, and `remove-node` (admin token required). Removed members are excluded from quorum immediately; the removed node stops receiving writes.
 - Snapshot restore is full broker state; request-id state is preserved.
 - Standalone (single-node) is lean and fast. Follower mode pairs durability with a minor latency cost; cluster mode gives automatic failover but is the slowest path — every write is a majority agreement across fsyncs.
 

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -20,6 +21,47 @@ var ErrNotLeader = errors.New("not the leader")
 
 var ErrLeaderLost = errors.New("leader lost quorum before the entry committed")
 var ErrLeaderTimeout = errors.New("timed out waiting for the entry to commit")
+
+type PeerSpec struct {
+	Index int    `json:"index"`
+	URL   string `json:"url,omitempty"`
+}
+
+type MembershipCommand struct {
+	Version uint16   `json:"version"`
+	Kind    uint8    `json:"kind"`
+	Spec    PeerSpec `json:"spec"`
+}
+
+const membershipMagic = "mq-raft-membership:"
+
+const (
+	MemberAddNode     = uint8(1)
+	MemberRemoveNode  = uint8(2)
+	MemberPromoteNode = uint8(3)
+)
+
+func encodeMembershipCommand(cmd MembershipCommand) []byte {
+	payload, _ := json.Marshal(cmd)
+	out := make([]byte, 0, len(membershipMagic)+len(payload))
+	out = append(out, membershipMagic...)
+	out = append(out, payload...)
+	return out
+}
+
+func decodeMembershipCommand(data []byte) (*MembershipCommand, bool) {
+	if len(data) < len(membershipMagic) || string(data[:len(membershipMagic)]) != membershipMagic {
+		return nil, false
+	}
+	var out MembershipCommand
+	if err := json.Unmarshal(data[len(membershipMagic):], &out); err != nil {
+		return nil, false
+	}
+	if out.Version != 1 {
+		return nil, false
+	}
+	return &out, true
+}
 
 type Entry struct {
 	Term    uint64
@@ -70,6 +112,7 @@ type Peer interface {
 	RequestVote(args RequestVoteArgs) RequestVoteReply
 	AppendEntries(args AppendEntriesArgs) AppendEntriesReply
 	InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply
+	PeerURL() string
 }
 
 type FSM interface {
@@ -87,6 +130,8 @@ type Storage interface {
 	TruncatePrefix(count uint64) error
 	LoadSnapshot() (*SnapshotRecord, error)
 	WriteSnapshot(record SnapshotRecord) error
+	LoadMembershipSnap() (*MembershipSnap, error)
+	WriteMembershipSnap(snap MembershipSnap) error
 	Close() error
 }
 
@@ -100,6 +145,8 @@ type Config struct {
 	Random           *rand.Rand
 
 	SnapshotThreshold uint64
+	Learner           bool
+	PeerFactory      func(PeerSpec) (Peer, error)
 }
 
 type Node struct {
@@ -125,7 +172,11 @@ type Node struct {
 	stop        chan struct{}
 	done        chan struct{}
 	stopOnce    sync.Once
-	leaderID    int
+
+	voter             []bool
+	leaderID          int
+	membershipPending bool
+
 	fatalErr    error
 	ticks       uint64
 	electionAt  uint64
@@ -178,14 +229,55 @@ func New(cfg Config, peers []Peer, fsm FSM) (*Node, error) {
 		log:         entries,
 		nextIndex:   make([]uint64, len(peers)),
 		matchIndex:  make([]uint64, len(peers)),
+		voter:       make([]bool, len(peers)),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 		heartbeatAt: 0,
 		leaderID:    -1,
 	}
+	n.voter = make([]bool, len(peers))
+	for i := range n.voter {
+		n.voter[i] = true
+	}
+	if cfg.Learner {
+		n.voter[cfg.Self] = false
+	}
+	n.loadMembershipLocked()
 	n.loadSnapshotLocked()
 	n.resetElectionDeadlineLocked()
 	return n, nil
+}
+
+func (n *Node) loadMembershipLocked() {
+	memberSnap, err := n.storage.LoadMembershipSnap()
+	if err != nil || memberSnap == nil || len(memberSnap.Peers) == 0 {
+		return
+	}
+	peers := make([]Peer, len(memberSnap.Peers))
+	voter := make([]bool, len(memberSnap.Peers))
+	for i := range memberSnap.Peers {
+		voter[i] = i < len(memberSnap.Voter) && memberSnap.Voter[i]
+		if i == n.cfg.Self || memberSnap.Peers[i].URL == "" {
+			continue
+		}
+		if n.cfg.PeerFactory == nil {
+			continue
+		}
+		peer, err := n.cfg.PeerFactory(memberSnap.Peers[i])
+		if err == nil && peer != nil {
+			peers[i] = peer
+		}
+	}
+	n.peers = peers
+	n.voter = voter
+	n.nextIndex = make([]uint64, len(peers))
+	n.matchIndex = make([]uint64, len(peers))
+	for i, peer := range n.peers {
+		if peer == nil || i == n.cfg.Self {
+			continue
+		}
+		n.nextIndex[i] = n.lastIndexLocked() + 1
+	}
 }
 
 func (n *Node) loadSnapshotLocked() {
@@ -350,7 +442,16 @@ func min(a, b uint64) uint64 {
 }
 
 func (n *Node) quorum() uint64 {
-	return uint64(len(n.peers)/2 + 1)
+	voters := 0
+	for i, voting := range n.voter {
+		if i >= len(n.peers) {
+			break
+		}
+		if voting {
+			voters++
+		}
+	}
+	return uint64(voters/2 + 1)
 }
 
 func (n *Node) RequestVote(args RequestVoteArgs) RequestVoteReply {
@@ -367,6 +468,12 @@ func (n *Node) RequestVote(args RequestVoteArgs) RequestVoteReply {
 		n.stepdownLocked(args.Term)
 	}
 	if args.Term < n.term {
+		return RequestVoteReply{Term: n.term, VoteGranted: false}
+	}
+	if n.cfg.Self < len(n.voter) && !n.voter[n.cfg.Self] {
+		return RequestVoteReply{Term: n.term, VoteGranted: false}
+	}
+	if args.CandidateID < len(n.voter) && !n.voter[args.CandidateID] {
 		return RequestVoteReply{Term: n.term, VoteGranted: false}
 	}
 	upToDate := args.LastLogTerm > n.lastTermLocked() || (args.LastLogTerm == n.lastTermLocked() && args.LastLogIndex >= n.lastIndexLocked())
@@ -524,14 +631,15 @@ func (n *Node) broadcastAppendEntriesLocked() {
 			LeaderCommit: n.commitIndex,
 		}
 	}
+	peerSnapshot := append([]Peer(nil), n.peers...)
 	n.mu.Unlock()
 	type result struct {
 		index int
 		reply AppendEntriesReply
 	}
-	results := make(chan result, len(n.peers))
+	results := make(chan result, len(peerSnapshot))
 	active := 0
-	for i, peer := range n.peers {
+	for i, peer := range peerSnapshot {
 		if peer == nil || i == n.cfg.Self {
 			continue
 		}
@@ -556,12 +664,12 @@ func (n *Node) broadcastAppendEntriesLocked() {
 			continue
 		}
 		if !got.reply.Success {
-			if next := n.nextIndex[i]; next > 1 {
-				next = min(next, got.reply.LastLogIndex+1)
-				if next > 1 {
-					n.nextIndex[i] = next - 1
-				}
+			next := min(n.nextIndex[i], got.reply.LastLogIndex+1)
+			if next == 0 {
+				next = 1
 			}
+			n.nextIndex[i] = next
+			n.matchIndex[i] = 0
 			n.mu.Unlock()
 			continue
 		}
@@ -577,6 +685,9 @@ func (n *Node) broadcastAppendEntriesLocked() {
 			matchCount := uint64(1)
 			for j, otherPeer := range n.peers {
 				if otherPeer == nil || j == n.cfg.Self {
+					continue
+				}
+				if j < len(n.voter) && !n.voter[j] {
 					continue
 				}
 				if n.matchIndex[j] >= c {
@@ -599,6 +710,10 @@ func (n *Node) broadcastAppendEntriesLocked() {
 }
 
 func (n *Node) startElectionLocked() {
+	if !n.voter[n.cfg.Self] {
+		n.resetElectionDeadlineLocked()
+		return
+	}
 	n.term++
 	if err := n.storage.SaveMeta(n.term, n.cfg.Self); err != nil {
 		n.haltLocked(err)
@@ -612,6 +727,9 @@ func (n *Node) startElectionLocked() {
 		if peer == nil || i == n.cfg.Self {
 			continue
 		}
+		if i < len(n.voter) && !n.voter[i] {
+			continue
+		}
 		argsList[i] = RequestVoteArgs{
 			Term:         n.term,
 			CandidateID:  n.cfg.Self,
@@ -619,10 +737,15 @@ func (n *Node) startElectionLocked() {
 			LastLogTerm:  n.lastTermLocked(),
 		}
 	}
+	peerSnapshot := append([]Peer(nil), n.peers...)
+	voterSnapshot := append([]bool(nil), n.voter...)
 	n.mu.Unlock()
 	votes := uint64(1)
-	for i, peer := range n.peers {
+	for i, peer := range peerSnapshot {
 		if peer == nil || i == n.cfg.Self {
+			continue
+		}
+		if i < len(voterSnapshot) && !voterSnapshot[i] {
 			continue
 		}
 		args := argsList[i]
@@ -696,6 +819,14 @@ func (n *Node) applyCommittedLocked() {
 		if !ok {
 			return
 		}
+		if cmd, ok := decodeMembershipCommand(entry.Command); ok {
+			n.applyMembershipLocked(*cmd)
+			n.lastApplied = next
+			n.membershipPending = false
+			n.maybeSnapshotLocked()
+			n.persistMembershipLocked()
+			continue
+		}
 		if err := n.fsm.Apply(entry.Command); err != nil {
 			n.haltLocked(err)
 			return
@@ -703,6 +834,141 @@ func (n *Node) applyCommittedLocked() {
 		n.lastApplied = next
 		n.maybeSnapshotLocked()
 	}
+}
+
+func (n *Node) applyMembershipLocked(cmd MembershipCommand) {
+	switch cmd.Kind {
+	case MemberAddNode:
+		for len(n.peers) <= cmd.Spec.Index {
+			n.peers = append(n.peers, nil)
+			n.voter = append(n.voter, false)
+			n.nextIndex = append(n.nextIndex, 0)
+			n.matchIndex = append(n.matchIndex, 0)
+		}
+		if n.cfg.PeerFactory != nil && cmd.Spec.Index != n.cfg.Self {
+			peer, err := n.cfg.PeerFactory(cmd.Spec)
+			if err == nil && peer != nil {
+				n.peers[cmd.Spec.Index] = peer
+			}
+		}
+	case MemberRemoveNode:
+		if cmd.Spec.Index == n.cfg.Self {
+			n.haltLocked(errors.New("removed self from membership"))
+			return
+		}
+		if cmd.Spec.Index < len(n.voter) {
+			n.voter[cmd.Spec.Index] = false
+			n.peers[cmd.Spec.Index] = nil
+		}
+	case MemberPromoteNode:
+		if cmd.Spec.Index < len(n.voter) {
+			n.voter[cmd.Spec.Index] = true
+		}
+	}
+}
+
+func (n *Node) persistMembershipLocked() {
+	specs := make([]PeerSpec, len(n.peers))
+	for i, peer := range n.peers {
+		specs[i] = PeerSpec{Index: i}
+		if peer != nil {
+			specs[i].URL = peer.PeerURL()
+		}
+	}
+	v := make([]bool, len(n.voter))
+	copy(v, n.voter)
+	_ = n.storage.WriteMembershipSnap(MembershipSnap{Peers: specs, Voter: v})
+}
+
+func (n *Node) AddNode(spec PeerSpec) (uint64, error) {
+	return n.proposeMembership(MemberAddNode, spec)
+}
+
+func (n *Node) RemoveNode(spec PeerSpec) (uint64, error) {
+	return n.proposeMembership(MemberRemoveNode, spec)
+}
+
+func (n *Node) PromoteNode(spec PeerSpec) (uint64, error) {
+	return n.proposeMembership(MemberPromoteNode, spec)
+}
+
+func (n *Node) proposeMembership(kind uint8, spec PeerSpec) (uint64, error) {
+	n.mu.Lock()
+	if n.fatalErr != nil {
+		n.mu.Unlock()
+		return 0, ErrFatal
+	}
+	if n.role != Leader {
+		n.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+	if n.membershipPending {
+		n.mu.Unlock()
+		return 0, errors.New("a membership change is already in flight")
+	}
+	if spec.Index == 0 && spec.URL == "" {
+		n.mu.Unlock()
+		return 0, errors.New("add-node requires url")
+	}
+	if spec.Index == 0 && spec.URL != "" {
+		spec.Index = len(n.peers)
+	}
+	for i := 0; i < len(n.peers); i++ {
+		if spec.URL != "" && i != n.cfg.Self {
+			if existing := n.peers[i]; existing != nil && existing.PeerURL() == spec.URL {
+				n.mu.Unlock()
+				return 0, errors.New("peer with that URL is already present")
+			}
+		}
+	}
+	command := encodeMembershipCommand(MembershipCommand{Version: 1, Kind: kind, Spec: spec})
+	entry := Entry{Term: n.term, Command: command}
+	if err := n.storage.Append(entry, uint64(len(n.log))+1); err != nil {
+		n.haltLocked(err)
+		n.mu.Unlock()
+		return 0, err
+	}
+	n.log = append(n.log, entry)
+	target := uint64(len(n.log))
+	n.membershipPending = true
+	n.broadcastAppendEntriesLocked()
+	n.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n.mu.Lock()
+		if n.fatalErr != nil {
+			defer n.mu.Unlock()
+			return 0, ErrFatal
+		}
+		if n.role != Leader {
+			n.mu.Unlock()
+			return 0, ErrLeaderLost
+		}
+		if n.lastApplied >= target {
+			n.mu.Unlock()
+			return uint64(spec.Index), nil
+		}
+		n.mu.Unlock()
+		if time.Now().After(deadline) {
+			return 0, ErrLeaderTimeout
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (n *Node) MembershipMembers() ([]PeerSpec, []bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	specs := make([]PeerSpec, len(n.peers))
+	for i, peer := range n.peers {
+		specs[i] = PeerSpec{Index: i}
+		if peer != nil {
+			specs[i].URL = peer.PeerURL()
+		}
+	}
+	voter := make([]bool, len(n.voter))
+	copy(voter, n.voter)
+	return specs, voter
 }
 
 func (n *Node) Propose(command []byte) (uint64, error) {
@@ -800,6 +1066,8 @@ func (n *Node) InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
 	}
 	return InstallSnapshotReply{Term: n.term}
 }
+
+func (n *Node) PeerURL() string { return "" }
 
 func (n *Node) Status() (role Role, term uint64, commitIndex uint64, lastIndex uint64) {
 	n.mu.Lock()

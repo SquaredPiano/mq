@@ -16,6 +16,8 @@ type HTTPPeer struct {
 	Client  *http.Client
 }
 
+func (p HTTPPeer) PeerURL() string { return p.BaseURL }
+
 func (p HTTPPeer) InstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
 	body, err := json.Marshal(args)
 	if err != nil {

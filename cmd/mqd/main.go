@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -56,6 +58,7 @@ func run() (runErr error) {
 	leaderEpoch := flag.Uint64("epoch", 0, "positive, monotonically increasing leader epoch")
 	raftPeers := flag.String("raft-peers", "", "comma-separated HTTP base URLs of every raft node in cluster mode (self included, in order)")
 	raftSelf := flag.Int("raft-self", -1, "index into -raft-peers for this node in cluster mode")
+	raftLearner := flag.Bool("raft-learner", false, "start this cluster node as a non-voting learner (for add-node); promote after joining")
 	raftToken := flag.String("raft-token", os.Getenv("MQ_RAFT_TOKEN"), "token for raft RPCs; may also be set with MQ_RAFT_TOKEN")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate PEM file; enables HTTPS")
 	tlsKey := flag.String("tls-key", "", "TLS private key PEM file; enables HTTPS")
@@ -145,7 +148,7 @@ func run() (runErr error) {
 			return errors.New("-raft-self is outside -raft-peers")
 		}
 		var err error
-		cluster, err = mqcluster.OpenWithPartitions(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond, *partitionCount)
+		cluster, err = mqcluster.OpenWithPartitions(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond, *partitionCount, *raftLearner)
 		if err != nil {
 			return fmt.Errorf("open cluster node: %w", err)
 		}
@@ -176,6 +179,10 @@ func run() (runErr error) {
 		mux := http.NewServeMux()
 		mux.Handle("/", base)
 		mux.Handle("/raft/", raft.HTTPHandler(cluster.Raft, *raftToken))
+		mux.Handle("/v1/admin/cluster/members", clusterAdminHandler(cluster.Raft, *adminToken))
+		mux.Handle("/v1/admin/cluster/add-node", clusterAdminHandler(cluster.Raft, *adminToken))
+		mux.Handle("/v1/admin/cluster/promote-node", clusterAdminHandler(cluster.Raft, *adminToken))
+		mux.Handle("/v1/admin/cluster/remove-node", clusterAdminHandler(cluster.Raft, *adminToken))
 		handler = mux
 	default:
 		return fmt.Errorf("unknown role %q (use standalone, leader, follower, or cluster)", *role)
@@ -235,6 +242,90 @@ func run() (runErr error) {
 		}
 	}
 	return nil
+}
+
+func clusterAdminHandler(node *raft.Node, adminToken string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if adminToken == "" {
+			http.Error(w, "admin token must be set for cluster members", http.StatusForbidden)
+			return
+		}
+		provided := r.Header.Get("Authorization")
+		credential, found := strings.CutPrefix(provided, "Bearer ")
+		if !found || subtle.ConstantTimeCompare([]byte(credential), []byte(adminToken)) != 1 {
+			http.Error(w, "invalid admin token", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/admin/cluster/members":
+			specs, voter := node.MembershipMembers()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"members": specs,
+				"voter":   voter,
+			})
+			return
+		case "/v1/admin/cluster/add-node":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct{ URL string `json:"url"` }
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.URL == "" {
+				http.Error(w, "invalid body", http.StatusBadRequest)
+				return
+			}
+			spec := raft.PeerSpec{URL: body.URL}
+			idx, err := node.AddNode(spec)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "index": idx, "members": nil})
+			return
+		case "/v1/admin/cluster/remove-node":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct{ Index int `json:"index"` }
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Index < 0 {
+				http.Error(w, "invalid body", http.StatusBadRequest)
+				return
+			}
+			spec := raft.PeerSpec{Index: body.Index}
+			idx, err := node.RemoveNode(spec)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "index": idx})
+			return
+		case "/v1/admin/cluster/promote-node":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct{ Index int `json:"index"` }
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Index < 0 {
+				http.Error(w, "invalid body", http.StatusBadRequest)
+				return
+			}
+			spec := raft.PeerSpec{Index: body.Index}
+			idx, err := node.PromoteNode(spec)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "index": idx})
+			return
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	})
 }
 
 func isLoopbackAddress(address string) bool {
