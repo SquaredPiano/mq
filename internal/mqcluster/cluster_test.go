@@ -284,7 +284,7 @@ func TestClusterMembershipLifecycle(t *testing.T) {
 	learnerURLs = append(learnerURLs, learnerServer.URL)
 
 	learnerDir := t.TempDir()
-	learnerNode, err := OpenWithPartitions(learnerDir, learnerURLs, 3, token, 20*time.Millisecond, 1, true)
+	learnerNode, err := OpenWithPartitions(learnerDir, learnerURLs, 3, token, 20*time.Millisecond, 1, true, 0)
 	if err != nil {
 		t.Fatalf("open learner: %v", err)
 	}

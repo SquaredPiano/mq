@@ -137,6 +137,17 @@ func (p *PartitionedLog) StartOffset() uint64 {
 	return p.startOffset
 }
 
+func (p *PartitionedLog) OldestOffsetBefore(cutoff time.Time) (uint64, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for i := 0; i < len(p.records); i++ {
+		if !p.records[i].Timestamp.Before(cutoff) {
+			return p.startOffset + uint64(i), i > 0
+		}
+	}
+	return p.startOffset + uint64(len(p.records)), len(p.records) > 0
+}
+
 func (p *PartitionedLog) RetainFrom(startOffset uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

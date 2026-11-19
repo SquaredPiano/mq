@@ -46,6 +46,10 @@ func run() (runErr error) {
 		"partitions", 1,
 		"number of partitions each topic is sharded into at start",
 	)
+	retentionMaxAge := flag.Duration(
+		"retention-max-age", 0,
+		"delete records older than this age (e.g. 24h); zero disables time-based retention",
+	)
 	snapshotInterval := flag.Int64(
 		"snapshot-interval-bytes", 64<<20,
 		"bytes of undeliverable WAL growth after the shared snapshot before the leader takes another checkpoint; zero stops automatic checkpointing",
@@ -77,6 +81,7 @@ func run() (runErr error) {
 		GroupCommitWindow: *groupCommitWindow,
 		WALSegmentBytes:   *walSegmentBytes,
 		PartitionCount:    *partitionCount,
+		MaxAge:            *retentionMaxAge,
 	})
 	if err != nil {
 		return fmt.Errorf("open broker: %w", err)
@@ -148,7 +153,7 @@ func run() (runErr error) {
 			return errors.New("-raft-self is outside -raft-peers")
 		}
 		var err error
-		cluster, err = mqcluster.OpenWithPartitions(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond, *partitionCount, *raftLearner)
+		cluster, err = mqcluster.OpenWithPartitions(*dataDir, urls, *raftSelf, *raftToken, 50*time.Millisecond, *partitionCount, *raftLearner, *retentionMaxAge)
 		if err != nil {
 			return fmt.Errorf("open cluster node: %w", err)
 		}

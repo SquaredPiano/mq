@@ -3,6 +3,7 @@ package log
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestPartitionedLogAppendsMonotonicOffsets(t *testing.T) {
@@ -68,5 +69,58 @@ func TestPartitionedLogHealthyAfterRetain(t *testing.T) {
 	}
 	if p.StartOffset() != 10 {
 		t.Fatalf("start offset = %d", p.StartOffset())
+	}
+}
+
+func TestPartitionedLogOldestOffsetBeforeKeepsNewEnough(t *testing.T) {
+	p, err := NewPartitionedLog(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	for i := 0; i < 3; i++ {
+		p.records = append(p.records, Record{Offset: uint64(i), Partition: 0, Key: []byte("k"), Value: []byte("v"), Timestamp: old})
+	}
+	p.records = append(p.records, Record{Offset: 3, Partition: 0, Key: []byte("k"), Value: []byte("v"), Timestamp: time.Now().UTC()})
+	cutoff := time.Now().Add(-time.Hour)
+	got, ok := p.OldestOffsetBefore(cutoff)
+	if !ok {
+		t.Fatal("expected some records to expire")
+	}
+	if got != 3 {
+		t.Fatalf("oldest offset before = %d, want 3", got)
+	}
+}
+
+func TestPartitionedLogOldestOffsetBeforeNothingExpires(t *testing.T) {
+	p, err := NewPartitionedLog(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Append([]byte("k"), []byte("v"))
+	got, ok := p.OldestOffsetBefore(time.Now().Add(-time.Hour))
+	if ok {
+		t.Fatalf("expected nothing to expire, got offset %d", got)
+	}
+	if got != p.StartOffset() {
+		t.Fatalf("start = %d, unchanged = %d", got, p.StartOffset())
+	}
+}
+
+func TestPartitionedLogOldestOffsetBeforeExpiresEverything(t *testing.T) {
+	p, err := NewPartitionedLog(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	for i := 0; i < 3; i++ {
+		p.records = append(p.records, Record{Offset: uint64(i), Partition: 0, Key: []byte("k"), Value: []byte("v"), Timestamp: old})
+	}
+	got, ok := p.OldestOffsetBefore(time.Now().Add(-time.Hour))
+	if !ok {
+		t.Fatal("expected something to expire")
+	}
+	if got != 3 {
+		t.Fatalf("oldest offset before = %d, want 3", got)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,7 @@ var (
 	ErrInvalidTopic            = errors.New("topic name must contain 1 to 255 bytes")
 	ErrInvalidGroup            = errors.New("consumer group name must contain 1 to 255 bytes")
 	ErrTopicNotFound           = errors.New("topic not found")
+	ErrNotLeader               = errors.New("not the leader")
 	ErrOffsetExpired           = messageLog.ErrOffsetExpired
 	ErrCommitOutOfRange        = errors.New("commit offset exceeds topic end")
 	ErrCommitRegression        = errors.New("commit offset cannot move backwards")
@@ -60,6 +62,8 @@ type OpenOptions struct {
 	WALSegmentBytes int64
 
 	PartitionCount int
+
+	MaxAge time.Duration
 }
 
 type GroupCommitStats struct {
@@ -148,17 +152,26 @@ type Broker struct {
 	groupCommitGroups  atomic.Uint64
 	groupCommitFrames  atomic.Uint64
 	partitionCount     int
+	maxAge             time.Duration
+	reaperStop         chan struct{}
+	reaperDone         chan struct{}
 }
 
 func New() *Broker {
 	return &Broker{partitionCount: 1}
 }
 
-func NewWithPartitions(n int) *Broker {
+func NewWithPartitions(n int, maxAge time.Duration) *Broker {
 	if n < 1 {
 		n = 1
 	}
-	return &Broker{partitionCount: n}
+	b := &Broker{partitionCount: n, maxAge: maxAge}
+	if maxAge > 0 {
+		b.reaperStop = make(chan struct{})
+		b.reaperDone = make(chan struct{})
+		go b.runRetentionReaper()
+	}
+	return b
 }
 
 func Open(dataDir string) (*Broker, error) {
@@ -175,6 +188,9 @@ func OpenWithOptions(dataDir string, options OpenOptions) (*Broker, error) {
 	}
 	if options.WALSegmentBytes < 0 {
 		return nil, errors.New("WAL segment size must not be negative")
+	}
+	if options.MaxAge < 0 {
+		return nil, errors.New("max retention age must not be negative")
 	}
 	if options.WALSegmentBytes == 0 {
 		options.WALSegmentBytes = DefaultWALSegmentBytes
@@ -215,6 +231,7 @@ func OpenWithOptions(dataDir string, options OpenOptions) (*Broker, error) {
 		groupCommitWindow: options.GroupCommitWindow,
 		segmentBytes:      options.WALSegmentBytes,
 		partitionCount:    options.PartitionCount,
+		maxAge:            options.MaxAge,
 	}
 	snapshot, digest, fileSize, err := loadSnapshot(filepath.Join(dataDir, snapshotFileName))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -250,6 +267,11 @@ func OpenWithOptions(dataDir string, options OpenOptions) (*Broker, error) {
 	b.publishDone = make(chan struct{})
 	b.acceptPublish = true
 	go b.runPublishGroupCommitter()
+	if b.maxAge > 0 {
+		b.reaperStop = make(chan struct{})
+		b.reaperDone = make(chan struct{})
+		go b.runRetentionReaper()
+	}
 	return b, nil
 }
 
@@ -276,6 +298,51 @@ func syncDirectory(path string) error {
 	return errors.Join(directory.Sync(), directory.Close())
 }
 
+func (b *Broker) runRetentionReaper() {
+	defer close(b.reaperDone)
+	interval := b.maxAge / 4
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.reaperStop:
+			return
+		case <-ticker.C:
+			b.reapAgedRecords()
+		}
+	}
+}
+
+func (b *Broker) reapAgedRecords() {
+	cutoff := time.Now().Add(-b.maxAge)
+	b.mu.RLock()
+	topics := make([]string, 0, len(b.topics))
+	hold := make([]*messageLog.PartitionedLog, 0, len(b.topics))
+	for topic, log := range b.topics {
+		topics = append(topics, topic)
+		hold = append(hold, log)
+	}
+	b.mu.RUnlock()
+	for i, tlog := range hold {
+		newStart, ok := tlog.OldestOffsetBefore(cutoff)
+		if !ok {
+			continue
+		}
+		if err := b.RetainFrom(topics[i], newStart); err != nil {
+			if errors.Is(err, ErrNotLeader) {
+				continue
+			}
+			log.Printf("retention reaper failed for topic %q: %v", topics[i], err)
+		}
+	}
+}
+
 func (b *Broker) Close() error {
 	b.publishSubmit.Lock()
 	b.writeMu.Lock()
@@ -295,6 +362,10 @@ func (b *Broker) Close() error {
 	b.publishSubmit.Unlock()
 	if done != nil {
 		<-done
+	}
+	if b.reaperStop != nil {
+		close(b.reaperStop)
+		<-b.reaperDone
 	}
 
 	b.writeMu.Lock()

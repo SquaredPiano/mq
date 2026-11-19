@@ -21,10 +21,10 @@ type Node struct {
 }
 
 func Open(dir string, peers []string, selfIndex int, raftToken string, heartbeat time.Duration) (*Node, error) {
-	return OpenWithPartitions(dir, peers, selfIndex, raftToken, heartbeat, 1, false)
+	return OpenWithPartitions(dir, peers, selfIndex, raftToken, heartbeat, 1, false, 0)
 }
 
-func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken string, heartbeat time.Duration, partitions int, learner bool) (*Node, error) {
+func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken string, heartbeat time.Duration, partitions int, learner bool, maxAge time.Duration) (*Node, error) {
 	if len(peers) == 0 {
 		return nil, errors.New("raft peers are required")
 	}
@@ -78,7 +78,7 @@ func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken str
 		return nil, fmt.Errorf("open raft storage: %w", err)
 	}
 	cfg.Storage = cfgStorage
-	b := broker.NewWithPartitions(partitions)
+	b := broker.NewWithPartitions(partitions, maxAge)
 	peersForRaft := make([]raft.Peer, len(peers))
 	for i, url := range peers {
 		if i == selfIndex {
@@ -100,6 +100,9 @@ func OpenWithPartitions(dir string, peers []string, selfIndex int, raftToken str
 			return err
 		}
 		if _, err := node.Propose(payload); err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				return broker.ErrNotLeader
+			}
 			return err
 		}
 		return nil

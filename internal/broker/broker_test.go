@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestDurablePublishFetchCommitRetainAndReopen(t *testing.T) {
@@ -164,5 +165,57 @@ func TestKeyRoutingIsConsistent(t *testing.T) {
 		if byte(r.Partition) != partition {
 			t.Fatalf("partition drifted from %d to %d mid-key", partition, r.Partition)
 		}
+	}
+}
+
+func TestMaxAgeDropsOldRecords(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    1,
+		MaxAge:            40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Publish("events", []byte("k"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err = queue.Fetch("events", 0, 1)
+		if errors.Is(err, ErrOffsetExpired) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected retention to drop the record, got err=%v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMaxAgeZeroDisablesTimeRetention(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Publish("events", []byte("k"), []byte("keeps")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, err := queue.Fetch("events", 0, 1); err != nil {
+		t.Fatalf("expected record to still be readable, got err=%v", err)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
