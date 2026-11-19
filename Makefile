@@ -26,7 +26,7 @@ venv:
 	bench/.venv/bin/pip install -r bench/requirements.txt
 
 clean:
-	rm -f bench/broker.bench bench/replication.bench bench/cluster.bench bench/values.json
+	rm -f bench/broker.bench bench/replication.bench bench/cluster.bench
 
 sec:
 	gosec -quiet -exclude=G115,G304,G404,G710,G104 ./...

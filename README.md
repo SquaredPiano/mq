@@ -40,6 +40,8 @@ Request ids give at-least-once delivery: a retry with the same id returns the or
 
 Messages are at most 256 KiB key+value. Batches are at most 32 records. Topic names, group names, and request ids are at most 255 bytes.
 
+Pass `-retention-max-age=24h` to age-expire records automatically (zero means disabled). Records older than the window are dropped from the oldest end; the age comes from each record's publish timestamp. Operator retention via `/v1/topics/retain` works the same way and is durable through the replication/raft log path.
+
 ## Run a cluster
 
 Primary-backup replication (follower first):
@@ -106,6 +108,24 @@ List current members and votes:
 ```sh
 curl -H "Authorization: Bearer $MQ_ADMIN_TOKEN" http://127.0.0.1:8081/v1/admin/cluster/members
 ```
+
+## Performance
+
+Measured on Apple M5 (darwin/arm64), 64-byte payloads, `-benchtime=500ms -count=1`. Durable paths are bound by fsync latency, not CPU.
+
+![performance](docs/performance.png)
+
+Reproduce and redraw the chart:
+
+```sh
+python3 -m venv bench/.venv && bench/.venv/bin/pip install -r bench/requirements.txt
+make bench
+make chart
+```
+
+`make bench` runs the benchmark suites with `-benchtime=500ms -count=1` and writes `bench/broker.bench`, `bench/replication.bench`, and `bench/cluster.bench`. `make chart` renders `docs/performance.png` from the broker and replication benches using `matplotlib` (`bench/render_chart.py`). Cluster numbers land in `bench/cluster.bench` and are not plotted; cluster publishes are the slow path — a raft majority commit across three fsyncs (measured: ~12 ms per publish, ~82 rec/s serially, ~2.6k records/s for batch of 32).
+
+On the Apple M5 with default fsync: durable single-node is ~240 rec/s serially, ~2.3k rec/s with shared group commit, ~7.5k rec/s in a batch of 32. The replicated follower path pays one synchronous round trip: ~120 rec/s serially, ~1.1k rec/s shared-sync, ~3.5k rec/s batch of 32. Fetching is RAM-bound at ~3.7 GB/s.
 
 ## Limits
 
