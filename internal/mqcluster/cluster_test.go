@@ -364,3 +364,75 @@ added:
 
 	removed:
 }
+
+func TestClusterGroupMembershipSurvivesLeaderChange(t *testing.T) {
+	nodes, _, _, _ := newTestCluster(t, 3)
+
+	leaderIdx := waitForLeader(t, nodes, 5*time.Second)
+	leader := nodes[leaderIdx]
+
+	if _, err := leader.Broker.Publish("events", []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	member, err := leader.Broker.GroupJoin("workers", "events", 3)
+	if err != nil {
+		t.Fatalf("group join: %v", err)
+	}
+	if len(member.Assigned) == 0 {
+		t.Fatalf("expected partitions assigned, got %v", member.Assigned)
+	}
+
+	members := leader.Broker.GroupList("workers", "events")
+	if len(members) != 1 || members[0].MemberID != member.MemberID {
+		t.Fatalf("expected 1 member, got %v", members)
+	}
+
+	if err := leader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var newLeader *Node
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for i, n := range nodes {
+			if i == leaderIdx {
+				continue
+			}
+			if n.Raft.StateRole() == raft.Leader {
+				newLeader = n
+				break
+			}
+		}
+		if newLeader != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if newLeader == nil {
+		t.Fatalf("no new leader elected after closing node %d", leaderIdx)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	var found bool
+	for time.Now().Before(deadline) {
+		members = newLeader.Broker.GroupList("workers", "events")
+		for _, m := range members {
+			if m.MemberID == member.MemberID {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !found {
+		t.Fatalf("member %s not found on new leader after failover; members=%v", member.MemberID, members)
+	}
+
+	if _, err := newLeader.Broker.GroupHeartbeat("workers", "events", member.MemberID, 3); err != nil {
+		t.Fatalf("heartbeat on new leader: %v", err)
+	}
+}

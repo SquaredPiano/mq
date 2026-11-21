@@ -27,7 +27,6 @@ const (
 
 type API struct {
 	broker                     *broker.Broker
-	groupRegistry              *groupsync.Registry
 	readOnly                   bool
 	leaderResolver             LeaderResolver
 	selfURL                    string
@@ -104,7 +103,7 @@ func NewHandler(b *broker.Broker) http.Handler {
 }
 
 func NewAuthenticatedHandler(b *broker.Broker, clientToken string) http.Handler {
-	a := &API{broker: b, groupRegistry: groupsync.New(), clientToken: clientToken}
+	a := &API{broker: b, clientToken: clientToken}
 	return a.handler()
 }
 
@@ -112,7 +111,7 @@ func NewAuthenticatedHandlerWithAdmin(b *broker.Broker, clientToken, adminToken 
 	if adminToken != "" && adminToken == clientToken {
 		return nil, errors.New("client and admin tokens must be different")
 	}
-	a := &API{broker: b, groupRegistry: groupsync.New(), clientToken: clientToken, adminToken: adminToken}
+	a := &API{broker: b, clientToken: clientToken, adminToken: adminToken}
 	return a.handler(), nil
 }
 
@@ -130,7 +129,7 @@ func NewAuthenticatedHandlerWithLeader(b *broker.Broker, clientToken, adminToken
 	if selfURL == "" {
 		return nil, errors.New("self URL is required in cluster mode")
 	}
-	a := &API{broker: b, groupRegistry: groupsync.New(), clientToken: clientToken, adminToken: adminToken, leaderResolver: resolve, selfURL: selfURL}
+	a := &API{broker: b, clientToken: clientToken, adminToken: adminToken, leaderResolver: resolve, selfURL: selfURL}
 	return a.handler(), nil
 }
 
@@ -153,7 +152,6 @@ func NewAuthenticatedLeaderHandlerWithAdmin(b *broker.Broker, replicationToken, 
 	}
 	a := &API{
 		broker:                     b,
-		groupRegistry:              groupsync.New(),
 		requireRequestID:           true,
 		clientToken:                clientToken,
 		adminToken:                 adminToken,
@@ -637,6 +635,13 @@ func (a *API) replicationSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) joinGroup(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/groups/join"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -648,15 +653,22 @@ func (a *API) joinGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	partitions := a.broker.PartitionCount(request.Topic)
-	member, err := a.groupRegistry.Join(request.Group, request.Topic, uint8(partitions))
+	member, err := a.broker.GroupJoin(request.Group, request.Topic, uint8(partitions))
 	if err != nil {
 		writeBrokerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, response{OK: true, Group: &member.Group, MemberID: &member.ID, Partitions: member.Assigned})
+	writeJSON(w, http.StatusOK, response{OK: true, Group: &member.Group, MemberID: &member.MemberID, Partitions: member.Assigned})
 }
 
 func (a *API) heartbeatGroup(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/groups/heartbeat"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -669,15 +681,22 @@ func (a *API) heartbeatGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	partitions := a.broker.PartitionCount(request.Topic)
-	member, err := a.groupRegistry.Heartbeat(request.Group, request.Topic, request.MemberID, uint8(partitions))
+	member, err := a.broker.GroupHeartbeat(request.Group, request.Topic, request.MemberID, uint8(partitions))
 	if err != nil {
 		writeBrokerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, response{OK: true, Group: &member.Group, MemberID: &member.ID, Partitions: member.Assigned})
+	writeJSON(w, http.StatusOK, response{OK: true, Group: &member.Group, MemberID: &member.MemberID, Partitions: member.Assigned})
 }
 
 func (a *API) leaveGroup(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/groups/leave"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -690,7 +709,7 @@ func (a *API) leaveGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	partitions := a.broker.PartitionCount(request.Topic)
-	if err := a.groupRegistry.Leave(request.Group, request.Topic, request.MemberID, uint8(partitions)); err != nil {
+	if err := a.broker.GroupLeave(request.Group, request.Topic, request.MemberID, uint8(partitions)); err != nil {
 		writeBrokerError(w, err)
 		return
 	}
@@ -698,6 +717,13 @@ func (a *API) leaveGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listGroup(w http.ResponseWriter, r *http.Request) {
+	if a.leaderResolver != nil {
+		if base, ok := a.leaderResolver("v1/groups/list"); ok && strings.TrimRight(base, "/") != strings.TrimRight(a.selfURL, "/") {
+			loc := strings.TrimRight(base, "/") + r.URL.RequestURI()
+			http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		writeError(w, http.StatusMethodNotAllowed, "method must be GET")
@@ -709,8 +735,12 @@ func (a *API) listGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "group and topic are required")
 		return
 	}
-	members := a.groupRegistry.List(group, topic)
-	writeJSON(w, http.StatusOK, response{OK: true, Members: members})
+	members := a.broker.GroupList(group, topic)
+	out := make([]groupsync.Member, 0, len(members))
+	for _, m := range members {
+		out = append(out, groupsync.Member{ID: m.MemberID, Group: m.Group, Topic: m.Topic, Assigned: m.Assigned, Expires: m.Expires})
+	}
+	writeJSON(w, http.StatusOK, response{OK: true, Members: out})
 }
 
 func (a *API) authorizeReplication(w http.ResponseWriter, r *http.Request) bool {

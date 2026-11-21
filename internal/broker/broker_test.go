@@ -219,3 +219,117 @@ func TestMaxAgeZeroDisablesTimeRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestGroupJoinHeartbeatLeaveList(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+
+	if _, err := queue.Publish("events", []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	m1, err := queue.GroupJoin("workers", "events", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m1.Assigned) == 0 {
+		t.Fatalf("expected partitions assigned, got %v", m1.Assigned)
+	}
+
+	m2, err := queue.GroupJoin("workers", "events", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.MemberID == m1.MemberID {
+		t.Fatalf("expected different member IDs")
+	}
+
+	members := queue.GroupList("workers", "events")
+	if len(members) != 2 {
+		t.Fatalf("expected 2 members, got %d", len(members))
+	}
+
+	m1b, err := queue.GroupHeartbeat("workers", "events", m1.MemberID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m1b.Expires.After(m1.Expires) {
+		t.Fatalf("expected heartbeat to extend expiry")
+	}
+
+	if err := queue.GroupLeave("workers", "events", m1.MemberID, 3); err != nil {
+		t.Fatal(err)
+	}
+	members = queue.GroupList("workers", "events")
+	if len(members) != 1 || members[0].MemberID != m2.MemberID {
+		t.Fatalf("expected only m2 after leave, got %v", members)
+	}
+
+	if err := queue.GroupLeave("workers", "events", "unknown", 3); err == nil {
+		t.Fatal("expected error leaving unknown member")
+	}
+
+	if _, err := queue.GroupHeartbeat("workers", "events", "unknown", 3); err == nil {
+		t.Fatal("expected error heartbeating unknown member")
+	}
+}
+
+func TestGroupJoinDuplicateIDReturnsExisting(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+
+	if _, err := queue.Publish("events", []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	m1, err := queue.GroupJoin("workers", "events", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := queue.GroupJoin("workers", "events", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.MemberID == m1.MemberID {
+		t.Fatalf("expected different member IDs for separate joins")
+	}
+
+	members := queue.GroupList("workers", "events")
+	if len(members) != 2 {
+		t.Fatalf("expected 2 members, got %d", len(members))
+	}
+}
+
+func TestGroupListEmptyForUnknownTopic(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+
+	members := queue.GroupList("workers", "nonexistent")
+	if len(members) != 0 {
+		t.Fatalf("expected 0 members for unknown topic, got %d", len(members))
+	}
+}

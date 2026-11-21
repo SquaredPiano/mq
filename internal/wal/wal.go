@@ -31,6 +31,13 @@ const (
 	kindBatch           byte  = 3
 	kindIdempotentBatch byte  = 4
 	kindRetention       byte  = 5
+	kindGroupMember     byte  = 6
+)
+
+const (
+	MemberActionJoin      uint8 = 1
+	MemberActionHeartbeat uint8 = 2
+	MemberActionLeave     uint8 = 3
 )
 
 var (
@@ -48,17 +55,21 @@ const (
 	BatchEntry
 	IdempotentBatchEntry
 	RetentionEntry
+	GroupMemberEntry
 )
 
 type Entry struct {
 	Kind        EntryKind
 	Topic       string
 	Group       string
-	RequestID   string
-	Record      messageLog.Record
-	Records     []messageLog.Record
-	NextOffset  uint64
-	StartOffset uint64
+	RequestID        string
+	MemberID         string
+	MemberAction     uint8
+	MemberPartitions uint8
+	Record           messageLog.Record
+	Records          []messageLog.Record
+	NextOffset       uint64
+	StartOffset      uint64
 }
 
 type EntryEncodingError struct {
@@ -568,6 +579,20 @@ func (w *WAL) AppendRetention(topic string, startOffset uint64) error {
 	return w.appendFrameLocked(kindRetention, payload)
 }
 
+func (w *WAL) AppendGroupMember(group, topic, memberID string, action uint8, partitions uint8) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.readyLocked(); err != nil {
+		return err
+	}
+
+	payload, err := encodeGroupMember(group, topic, memberID, action, partitions)
+	if err != nil {
+		return err
+	}
+	return w.appendFrameLocked(kindGroupMember, payload)
+}
+
 func (w *WAL) AppendGroup(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -955,6 +980,9 @@ func encodeEntry(entry Entry) (byte, []byte, error) {
 	case RetentionEntry:
 		payload, err := encodeRetention(entry.Topic, entry.StartOffset)
 		return kindRetention, payload, err
+	case GroupMemberEntry:
+		payload, err := encodeGroupMember(entry.Group, entry.Topic, entry.MemberID, entry.MemberAction, entry.MemberPartitions)
+		return kindGroupMember, payload, err
 	default:
 		return 0, nil, fmt.Errorf("unknown WAL entry kind %d", entry.Kind)
 	}
@@ -1161,6 +1189,22 @@ func encodeRetention(topic string, startOffset uint64) ([]byte, error) {
 	return payload, nil
 }
 
+func encodeGroupMember(group, topic, memberID string, action uint8, partitions uint8) ([]byte, error) {
+	if len(group) > maxStringBytes || len(topic) > maxStringBytes || len(memberID) > maxStringBytes {
+		return nil, errors.New("group, topic, or member ID exceeds WAL string limit")
+	}
+	if action != MemberActionJoin && action != MemberActionHeartbeat && action != MemberActionLeave {
+		return nil, errors.New("invalid group member action")
+	}
+	payload := make([]byte, 0, 2+len(group)+2+len(topic)+2+len(memberID)+1+1)
+	payload = appendString(payload, group)
+	payload = appendString(payload, topic)
+	payload = appendString(payload, memberID)
+	payload = appendUint8(payload, action)
+	payload = appendUint8(payload, partitions)
+	return payload, nil
+}
+
 func decodeEntry(kind byte, payload []byte) (Entry, error) {
 	reader := payloadReader{data: payload}
 	switch kind {
@@ -1257,6 +1301,31 @@ func decodeEntry(kind byte, payload []byte) (Entry, error) {
 			return Entry{}, err
 		}
 		return Entry{Kind: RetentionEntry, Topic: topic, StartOffset: startOffset}, nil
+	case kindGroupMember:
+		group, err := reader.readString()
+		if err != nil {
+			return Entry{}, err
+		}
+		topic, err := reader.readString()
+		if err != nil {
+			return Entry{}, err
+		}
+		memberID, err := reader.readString()
+		if err != nil {
+			return Entry{}, err
+		}
+		action, err := reader.readUint8()
+		if err != nil {
+			return Entry{}, err
+		}
+		partitions, err := reader.readUint8()
+		if err != nil {
+			return Entry{}, err
+		}
+		if err := reader.requireDone(); err != nil {
+			return Entry{}, err
+		}
+		return Entry{Kind: GroupMemberEntry, Group: group, Topic: topic, MemberID: memberID, MemberAction: action, MemberPartitions: partitions}, nil
 	default:
 		return Entry{}, fmt.Errorf("unknown entry kind %d", kind)
 	}
@@ -1301,9 +1370,13 @@ func appendString(destination []byte, value string) []byte {
 }
 
 func appendUint16(destination []byte, value uint16) []byte {
-	var encoded [2]byte
-	binary.LittleEndian.PutUint16(encoded[:], value)
+	encoded := make([]byte, 2)
+	binary.LittleEndian.PutUint16(encoded, value)
 	return append(destination, encoded[:]...)
+}
+
+func appendUint8(destination []byte, value uint8) []byte {
+	return append(destination, value)
 }
 
 func appendUint32(destination []byte, value uint32) []byte {
@@ -1338,6 +1411,14 @@ func (r *payloadReader) readUint16() (uint16, error) {
 		return 0, err
 	}
 	return binary.LittleEndian.Uint16(value), nil
+}
+
+func (r *payloadReader) readUint8() (uint8, error) {
+	value, err := r.readBytes(1)
+	if err != nil {
+		return 0, err
+	}
+	return value[0], nil
 }
 
 func (r *payloadReader) readUint32() (uint32, error) {

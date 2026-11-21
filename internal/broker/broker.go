@@ -1,8 +1,10 @@
 package broker
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -10,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +29,7 @@ var (
 	ErrInvalidGroup            = errors.New("consumer group name must contain 1 to 255 bytes")
 	ErrTopicNotFound           = errors.New("topic not found")
 	ErrNotLeader               = errors.New("not the leader")
+	ErrUnknownMember           = errors.New("unknown group member")
 	ErrOffsetExpired           = messageLog.ErrOffsetExpired
 	ErrCommitOutOfRange        = errors.New("commit offset exceeds topic end")
 	ErrCommitRegression        = errors.New("commit offset cannot move backwards")
@@ -81,6 +85,20 @@ func (s GroupCommitStats) FramesPerGroup() float64 {
 type groupTopic struct {
 	group string
 	topic string
+}
+
+type groupMemberKey struct {
+	group    string
+	topic    string
+	memberID string
+}
+
+type groupMember struct {
+	MemberID string
+	Group    string
+	Topic    string
+	Assigned []int
+	Expires  time.Time
 }
 
 type publishResult struct {
@@ -155,17 +173,18 @@ type Broker struct {
 	maxAge             time.Duration
 	reaperStop         chan struct{}
 	reaperDone         chan struct{}
+	groupMembers       map[groupMemberKey]groupMember
 }
 
 func New() *Broker {
-	return &Broker{partitionCount: 1}
+	return &Broker{partitionCount: 1, groupMembers: make(map[groupMemberKey]groupMember)}
 }
 
 func NewWithPartitions(n int, maxAge time.Duration) *Broker {
 	if n < 1 {
 		n = 1
 	}
-	b := &Broker{partitionCount: n, maxAge: maxAge}
+	b := &Broker{partitionCount: n, maxAge: maxAge, groupMembers: make(map[groupMemberKey]groupMember)}
 	if maxAge > 0 {
 		b.reaperStop = make(chan struct{})
 		b.reaperDone = make(chan struct{})
@@ -232,6 +251,7 @@ func OpenWithOptions(dataDir string, options OpenOptions) (*Broker, error) {
 		segmentBytes:      options.WALSegmentBytes,
 		partitionCount:    options.PartitionCount,
 		maxAge:            options.MaxAge,
+		groupMembers:      make(map[groupMemberKey]groupMember),
 	}
 	snapshot, digest, fileSize, err := loadSnapshot(filepath.Join(dataDir, snapshotFileName))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1472,6 +1492,251 @@ func (b *Broker) Commit(group, topic string, nextOffset uint64) error {
 	return b.replicateLocked()
 }
 
+const memberTimeout = 20 * time.Second
+
+func (b *Broker) GroupJoin(group, topic string, partitions uint8) (groupMember, error) {
+	if !validName(group) {
+		return groupMember{}, ErrInvalidGroup
+	}
+	if !validName(topic) {
+		return groupMember{}, ErrInvalidTopic
+	}
+
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if b.closing || b.closed {
+		return groupMember{}, ErrBrokerClosed
+	}
+	if b.unavailable != nil {
+		return groupMember{}, fmt.Errorf("%w: %v", ErrBrokerUnavailable, b.unavailable)
+	}
+	if b.readOnly {
+		return groupMember{}, ErrReadOnly
+	}
+
+	b.mu.RLock()
+	_, topicExists := b.topics[topic]
+	b.mu.RUnlock()
+	if !topicExists {
+		return groupMember{}, fmt.Errorf("%w: %q", ErrTopicNotFound, topic)
+	}
+
+	id, err := freshMemberID()
+	if err != nil {
+		return groupMember{}, err
+	}
+
+	if b.propose != nil {
+		entry := wal.Entry{Kind: wal.GroupMemberEntry, Group: group, Topic: topic, MemberID: id, MemberAction: wal.MemberActionJoin, MemberPartitions: partitions}
+		if err := b.propose([]wal.Entry{entry}); err != nil {
+			return groupMember{}, err
+		}
+	} else if b.wal != nil {
+		if err := b.wal.AppendGroupMember(group, topic, id, wal.MemberActionJoin, partitions); err != nil {
+			return groupMember{}, err
+		}
+	}
+
+	m := b.applyGroupMemberLocked(group, topic, id, wal.MemberActionJoin, partitions)
+	return m, nil
+}
+
+func (b *Broker) GroupHeartbeat(group, topic, memberID string, partitions uint8) (groupMember, error) {
+	if !validName(group) {
+		return groupMember{}, ErrInvalidGroup
+	}
+	if !validName(topic) {
+		return groupMember{}, ErrInvalidTopic
+	}
+
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if b.closing || b.closed {
+		return groupMember{}, ErrBrokerClosed
+	}
+	if b.unavailable != nil {
+		return groupMember{}, fmt.Errorf("%w: %v", ErrBrokerUnavailable, b.unavailable)
+	}
+	if b.readOnly {
+		return groupMember{}, ErrReadOnly
+	}
+
+	b.mu.RLock()
+	_, topicExists := b.topics[topic]
+	b.mu.RUnlock()
+	if !topicExists {
+		return groupMember{}, fmt.Errorf("%w: %q", ErrTopicNotFound, topic)
+	}
+
+	if b.propose != nil {
+		entry := wal.Entry{Kind: wal.GroupMemberEntry, Group: group, Topic: topic, MemberID: memberID, MemberAction: wal.MemberActionHeartbeat, MemberPartitions: partitions}
+		if err := b.propose([]wal.Entry{entry}); err != nil {
+			return groupMember{}, err
+		}
+	} else if b.wal != nil {
+		if err := b.wal.AppendGroupMember(group, topic, memberID, wal.MemberActionHeartbeat, partitions); err != nil {
+			return groupMember{}, err
+		}
+	}
+
+	m := b.applyGroupMemberLocked(group, topic, memberID, wal.MemberActionHeartbeat, partitions)
+	if m.MemberID == "" {
+		return groupMember{}, ErrUnknownMember
+	}
+	return m, nil
+}
+
+func (b *Broker) GroupLeave(group, topic, memberID string, partitions uint8) error {
+	if !validName(group) {
+		return ErrInvalidGroup
+	}
+	if !validName(topic) {
+		return ErrInvalidTopic
+	}
+
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if b.closing || b.closed {
+		return ErrBrokerClosed
+	}
+	if b.unavailable != nil {
+		return fmt.Errorf("%w: %v", ErrBrokerUnavailable, b.unavailable)
+	}
+	if b.readOnly {
+		return ErrReadOnly
+	}
+
+	b.mu.RLock()
+	_, topicExists := b.topics[topic]
+	b.mu.RUnlock()
+	if !topicExists {
+		return fmt.Errorf("%w: %q", ErrTopicNotFound, topic)
+	}
+
+	if b.propose != nil {
+		entry := wal.Entry{Kind: wal.GroupMemberEntry, Group: group, Topic: topic, MemberID: memberID, MemberAction: wal.MemberActionLeave, MemberPartitions: partitions}
+		if err := b.propose([]wal.Entry{entry}); err != nil {
+			return err
+		}
+	} else if b.wal != nil {
+		if err := b.wal.AppendGroupMember(group, topic, memberID, wal.MemberActionLeave, partitions); err != nil {
+			return err
+		}
+	}
+
+	if m := b.applyGroupMemberLocked(group, topic, memberID, wal.MemberActionLeave, partitions); m.MemberID == "" {
+		return ErrUnknownMember
+	}
+	return nil
+}
+
+func (b *Broker) GroupList(group, topic string) []groupMember {
+	if !validName(group) || !validName(topic) {
+		return nil
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	now := time.Now()
+	out := make([]groupMember, 0, 4)
+	for k, m := range b.groupMembers {
+		if k.group != group || k.topic != topic {
+			continue
+		}
+		if !m.Expires.After(now) {
+			continue
+		}
+		out = append(out, groupMember{MemberID: m.MemberID, Group: m.Group, Topic: m.Topic, Assigned: append([]int(nil), m.Assigned...), Expires: m.Expires})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MemberID < out[j].MemberID })
+	return out
+}
+
+func (b *Broker) applyGroupMemberLocked(group, topic, memberID string, action uint8, partitions uint8) groupMember {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	key := groupMemberKey{group: group, topic: topic, memberID: memberID}
+	switch action {
+	case wal.MemberActionJoin:
+		if _, exists := b.groupMembers[key]; exists {
+			return b.groupMembers[key]
+		}
+		m := groupMember{MemberID: memberID, Group: group, Topic: topic, Assigned: nil, Expires: time.Now().Add(memberTimeout)}
+		b.groupMembers[key] = m
+		members := b.groupMembersFor(group, topic)
+		b.roundRobinAssignLocked(members, uint64(partitions))
+		for _, mm := range members {
+			if mm.MemberID == memberID {
+				b.groupMembers[key] = *mm
+			}
+		}
+		return b.groupMembers[key]
+	case wal.MemberActionHeartbeat:
+		m, exists := b.groupMembers[key]
+		if !exists {
+			return groupMember{}
+		}
+		m.Expires = time.Now().Add(memberTimeout)
+		b.groupMembers[key] = m
+		members := b.groupMembersFor(group, topic)
+		b.roundRobinAssignLocked(members, uint64(partitions))
+		for _, mm := range members {
+			if mm.MemberID == memberID {
+				b.groupMembers[key] = *mm
+			}
+		}
+		return b.groupMembers[key]
+	case wal.MemberActionLeave:
+		m, exists := b.groupMembers[key]
+		if !exists {
+			return groupMember{}
+		}
+		delete(b.groupMembers, key)
+		members := b.groupMembersFor(group, topic)
+		b.roundRobinAssignLocked(members, uint64(partitions))
+		for _, mm := range members {
+			b.groupMembers[groupMemberKey{group: group, topic: topic, memberID: mm.MemberID}] = *mm
+		}
+		return m
+	default:
+		return groupMember{}
+	}
+}
+
+func (b *Broker) groupMembersFor(group, topic string) []*groupMember {
+	members := make([]*groupMember, 0, 4)
+	for k, m := range b.groupMembers {
+		if k.group == group && k.topic == topic {
+			cp := m
+			members = append(members, &cp)
+		}
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].MemberID < members[j].MemberID })
+	return members
+}
+
+func (b *Broker) roundRobinAssignLocked(members []*groupMember, partitions uint64) {
+	n := len(members)
+	if n == 0 {
+		return
+	}
+	for i, m := range members {
+		m.Assigned = nil
+		for p := uint64(i); p < partitions; p += uint64(n) {
+			m.Assigned = append(m.Assigned, int(p))
+		}
+	}
+}
+
+func freshMemberID() (string, error) {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate member id: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
+}
+
 func (b *Broker) RetainFrom(topic string, startOffset uint64) error {
 	if !validName(topic) {
 		return ErrInvalidTopic
@@ -1626,6 +1891,21 @@ func (b *Broker) applyEntry(entry wal.Entry) error {
 			return ErrRetentionOutOfRange
 		}
 		return topicLog.RetainFrom(entry.StartOffset)
+	case wal.GroupMemberEntry:
+		if !validName(entry.Group) {
+			return ErrInvalidGroup
+		}
+		if !validName(entry.Topic) {
+			return ErrInvalidTopic
+		}
+		b.mu.RLock()
+		_, topicExists := b.topics[entry.Topic]
+		b.mu.RUnlock()
+		if !topicExists {
+			return fmt.Errorf("%w: %q", ErrTopicNotFound, entry.Topic)
+		}
+		b.applyGroupMemberLocked(entry.Group, entry.Topic, entry.MemberID, entry.MemberAction, entry.MemberPartitions)
+		return nil
 	default:
 		return fmt.Errorf("unknown WAL entry kind %d", entry.Kind)
 	}
