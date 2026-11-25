@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	pprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -200,6 +201,15 @@ func run() (runErr error) {
 		}()
 	}
 
+	mux := http.NewServeMux()
+	mux.Handle("/", handler)
+	mux.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+	handler = mux
+
 	server := &http.Server{
 		Addr:              *address,
 		Handler:           handler,
@@ -275,7 +285,9 @@ func clusterAdminHandler(node *raft.Node, adminToken string) http.Handler {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			var body struct{ URL string `json:"url"` }
+			var body struct {
+				URL string `json:"url"`
+			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.URL == "" {
 				http.Error(w, "invalid body", http.StatusBadRequest)
 				return
@@ -294,7 +306,9 @@ func clusterAdminHandler(node *raft.Node, adminToken string) http.Handler {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			var body struct{ Index int `json:"index"` }
+			var body struct {
+				Index int `json:"index"`
+			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Index < 0 {
 				http.Error(w, "invalid body", http.StatusBadRequest)
 				return
@@ -313,7 +327,9 @@ func clusterAdminHandler(node *raft.Node, adminToken string) http.Handler {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			var body struct{ Index int `json:"index"` }
+			var body struct {
+				Index int `json:"index"`
+			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Index < 0 {
 				http.Error(w, "invalid body", http.StatusBadRequest)
 				return

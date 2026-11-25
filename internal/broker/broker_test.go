@@ -333,3 +333,88 @@ func TestGroupListEmptyForUnknownTopic(t *testing.T) {
 		t.Fatalf("expected 0 members for unknown topic, got %d", len(members))
 	}
 }
+
+func TestBrokerStats(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    3,
+		MaxAge:            24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+
+	if _, err := queue.Publish("events", []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Publish("events", []byte("k2"), []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Publish("logs", []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := queue.Stats()
+	if stats.TopicCount != 2 {
+		t.Fatalf("expected 2 topics, got %d", stats.TopicCount)
+	}
+	if stats.Closed {
+		t.Fatal("expected broker not closed")
+	}
+	if stats.Closing {
+		t.Fatal("expected broker not closing")
+	}
+	if stats.RetentionMaxAgeSecs != 24*3600 {
+		t.Fatalf("expected retention 86400s, got %g", stats.RetentionMaxAgeSecs)
+	}
+
+	events, ok := stats.Topics["events"]
+	if !ok {
+		t.Fatal("expected events topic stats")
+	}
+	if events.RecordCount != 2 {
+		t.Fatalf("expected 2 records in events, got %d", events.RecordCount)
+	}
+	if events.Partitions != 3 {
+		t.Fatalf("expected 3 partitions, got %d", events.Partitions)
+	}
+	logs, ok := stats.Topics["logs"]
+	if !ok {
+		t.Fatal("expected logs topic stats")
+	}
+	if logs.RecordCount != 1 {
+		t.Fatalf("expected 1 record in logs, got %d", logs.RecordCount)
+	}
+
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats = queue.Stats()
+	if !stats.Closed {
+		t.Fatal("expected broker closed after Close")
+	}
+}
+
+func TestBrokerReady(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := OpenWithOptions(dir, OpenOptions{
+		GroupCommitWindow: DefaultGroupCommitWindow,
+		WALSegmentBytes:   DefaultWALSegmentBytes,
+		PartitionCount:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queue.Ready() {
+		t.Fatal("expected broker ready")
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if queue.Ready() {
+		t.Fatal("expected broker not ready after Close")
+	}
+}

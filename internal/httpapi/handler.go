@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -211,6 +213,9 @@ func (a *API) handler() http.Handler {
 	if a.replicationMetricsProvider != nil {
 		mux.HandleFunc("/internal/replication/metrics", a.replicationMetrics)
 	}
+	mux.HandleFunc("/healthz", a.healthz)
+	mux.HandleFunc("/readyz", a.readyz)
+	mux.HandleFunc("/metrics", a.metrics)
 	return mux
 }
 
@@ -754,6 +759,97 @@ func (a *API) authorizeReplication(w http.ResponseWriter, r *http.Request) bool 
 
 func (a *API) notFound(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "endpoint not found")
+}
+
+func (a *API) healthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method must be GET")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": "ok"})
+}
+
+func (a *API) readyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method must be GET")
+		return
+	}
+	if !a.broker.Ready() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "status": "not ready"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": "ready"})
+}
+
+func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method must be GET")
+		return
+	}
+	stats := a.broker.Stats()
+	var sb strings.Builder
+	sb.WriteString("# HELP mq_broker_topics Total number of topics\n")
+	sb.WriteString("# TYPE mq_broker_topics gauge\n")
+	sb.WriteString(fmt.Sprintf("mq_broker_topics %d\n", stats.TopicCount))
+	sb.WriteString("# HELP mq_broker_group_commits_total Total number of group commit batches\n")
+	sb.WriteString("# TYPE mq_broker_group_commits_total counter\n")
+	sb.WriteString(fmt.Sprintf("mq_broker_group_commits_total %d\n", stats.GroupCommits))
+	sb.WriteString("# HELP mq_broker_group_frames_total Total number of records in group commit batches\n")
+	sb.WriteString("# TYPE mq_broker_group_frames_total counter\n")
+	sb.WriteString(fmt.Sprintf("mq_broker_group_frames_total %d\n", stats.GroupFrames))
+	sb.WriteString("# HELP mq_broker_wal_size_bytes Current WAL size in bytes\n")
+	sb.WriteString("# TYPE mq_broker_wal_size_bytes gauge\n")
+	sb.WriteString(fmt.Sprintf("mq_broker_wal_size_bytes %d\n", stats.WALSizeBytes))
+	sb.WriteString("# HELP mq_broker_retention_max_age_seconds Configured retention max age in seconds (0 = disabled)\n")
+	sb.WriteString("# TYPE mq_broker_retention_max_age_seconds gauge\n")
+	sb.WriteString(fmt.Sprintf("mq_broker_retention_max_age_seconds %g\n", stats.RetentionMaxAgeSecs))
+	sb.WriteString("# HELP mq_broker_closed Whether the broker is closed\n")
+	sb.WriteString("# TYPE mq_broker_closed gauge\n")
+	if stats.Closed {
+		sb.WriteString("mq_broker_closed 1\n")
+	} else {
+		sb.WriteString("mq_broker_closed 0\n")
+	}
+	sb.WriteString("# HELP mq_broker_closing Whether the broker is closing\n")
+	sb.WriteString("# TYPE mq_broker_closing gauge\n")
+	if stats.Closing {
+		sb.WriteString("mq_broker_closing 1\n")
+	} else {
+		sb.WriteString("mq_broker_closing 0\n")
+	}
+	topicNames := make([]string, 0, len(stats.Topics))
+	for name := range stats.Topics {
+		topicNames = append(topicNames, name)
+	}
+	sort.Strings(topicNames)
+	for _, name := range topicNames {
+		t := stats.Topics[name]
+		topic := fmt.Sprintf("%q", name)
+		sb.WriteString("# HELP mq_topic_record_count Number of records retained in a topic\n")
+		sb.WriteString("# TYPE mq_topic_record_count gauge\n")
+		sb.WriteString(fmt.Sprintf("mq_topic_record_count{topic=%s} %d\n", topic, t.RecordCount))
+		sb.WriteString("# HELP mq_topic_start_offset Current start offset of a topic\n")
+		sb.WriteString("# TYPE mq_topic_start_offset gauge\n")
+		sb.WriteString(fmt.Sprintf("mq_topic_start_offset{topic=%s} %d\n", topic, t.StartOffset))
+		sb.WriteString("# HELP mq_topic_end_offset Current end offset of a topic\n")
+		sb.WriteString("# TYPE mq_topic_end_offset gauge\n")
+		sb.WriteString(fmt.Sprintf("mq_topic_end_offset{topic=%s} %d\n", topic, t.EndOffset))
+		sb.WriteString("# HELP mq_topic_partition_count Number of partitions in a topic\n")
+		sb.WriteString("# TYPE mq_topic_partition_count gauge\n")
+		sb.WriteString(fmt.Sprintf("mq_topic_partition_count{topic=%s} %d\n", topic, t.Partitions))
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(sb.String()))
 }
 
 func requirePost(w http.ResponseWriter, r *http.Request) bool {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"mq/internal/broker"
@@ -94,4 +95,87 @@ func readAll(response *http.Response) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	_, err := buf.ReadFrom(response.Body)
 	return buf.Bytes(), err
+}
+
+func TestHealthzEndpoint(t *testing.T) {
+	queue, err := broker.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = queue.Close()
+	})
+	handler := NewAuthenticatedHandler(queue, "")
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		OK      bool   `json:"ok"`
+		Status  string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || !body.OK || body.Status != "ok" {
+		t.Fatalf("healthz body = %s", rec.Body.String())
+	}
+}
+
+func TestReadyzEndpoint(t *testing.T) {
+	queue, err := broker.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAuthenticatedHandler(queue, "")
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readyz status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz after close status = %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	queue, err := broker.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = queue.Close()
+	})
+	if _, err := queue.Publish("events", []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAuthenticatedHandler(queue, "")
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "mq_broker_topics") {
+		t.Fatalf("expected mq_broker_topics metric, got: %s", body)
+	}
+	if !strings.Contains(body, "mq_broker_group_commits_total") {
+		t.Fatalf("expected mq_broker_group_commits_total metric, got: %s", body)
+	}
+	if !strings.Contains(body, "mq_broker_wal_size_bytes") {
+		t.Fatalf("expected mq_broker_wal_size_bytes metric, got: %s", body)
+	}
+	if !strings.Contains(body, "mq_topic_record_count") {
+		t.Fatalf("expected mq_topic_record_count metric, got: %s", body)
+	}
+	if !strings.Contains(body, "mq_broker_closed") {
+		t.Fatalf("expected mq_broker_closed metric, got: %s", body)
+	}
 }

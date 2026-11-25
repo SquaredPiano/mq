@@ -82,6 +82,24 @@ func (s GroupCommitStats) FramesPerGroup() float64 {
 	return float64(s.Frames) / float64(s.Groups)
 }
 
+type TopicStats struct {
+	StartOffset uint64 `json:"start_offset"`
+	EndOffset   uint64 `json:"end_offset"`
+	Partitions  int    `json:"partitions"`
+	RecordCount uint64 `json:"record_count"`
+}
+
+type BrokerStats struct {
+	Topics              map[string]TopicStats `json:"topics"`
+	TopicCount          int                   `json:"topic_count"`
+	GroupCommits        uint64                `json:"group_commits"`
+	GroupFrames         uint64                `json:"group_frames"`
+	WALSizeBytes        int64                 `json:"wal_size_bytes"`
+	RetentionMaxAgeSecs float64               `json:"retention_max_age_seconds"`
+	Closed              bool                  `json:"closed"`
+	Closing             bool                  `json:"closing"`
+}
+
 type groupTopic struct {
 	group string
 	topic string
@@ -408,6 +426,45 @@ func (b *Broker) PublishGroupCommitStats() GroupCommitStats {
 		Groups: b.groupCommitGroups.Load(),
 		Frames: b.groupCommitFrames.Load(),
 	}
+}
+
+func (b *Broker) Ready() bool {
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	return !b.closed && !b.closing
+}
+
+func (b *Broker) Stats() BrokerStats {
+	b.mu.RLock()
+	topics := make(map[string]TopicStats, len(b.topics))
+	for name, topicLog := range b.topics {
+		start := topicLog.StartOffset()
+		end := topicLog.EndOffset()
+		topics[name] = TopicStats{
+			StartOffset: start,
+			EndOffset:   end,
+			Partitions:  topicLog.Partitions(),
+			RecordCount: end - start,
+		}
+	}
+	b.mu.RUnlock()
+
+	stats := BrokerStats{
+		Topics:              topics,
+		TopicCount:          len(topics),
+		GroupCommits:        b.groupCommitGroups.Load(),
+		GroupFrames:         b.groupCommitFrames.Load(),
+		WALSizeBytes:        0,
+		RetentionMaxAgeSecs: b.maxAge.Seconds(),
+		Closed:              b.closed,
+		Closing:             b.closing,
+	}
+	if current := b.currentWAL(); current != nil {
+		if size, err := current.Size(); err == nil {
+			stats.WALSizeBytes = size
+		}
+	}
+	return stats
 }
 
 func (b *Broker) SetReadOnly() error {
