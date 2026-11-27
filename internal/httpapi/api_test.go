@@ -113,8 +113,8 @@ func TestHealthzEndpoint(t *testing.T) {
 		t.Fatalf("healthz status = %d, body %s", rec.Code, rec.Body.String())
 	}
 	var body struct {
-		OK      bool   `json:"ok"`
-		Status  string `json:"status"`
+		OK     bool   `json:"ok"`
+		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || !body.OK || body.Status != "ok" {
 		t.Fatalf("healthz body = %s", rec.Body.String())

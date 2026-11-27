@@ -59,9 +59,9 @@ const (
 )
 
 type Entry struct {
-	Kind        EntryKind
-	Topic       string
-	Group       string
+	Kind             EntryKind
+	Topic            string
+	Group            string
 	RequestID        string
 	MemberID         string
 	MemberAction     uint8

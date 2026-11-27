@@ -315,7 +315,6 @@ func TestClusterMembershipLifecycle(t *testing.T) {
 	}
 	t.Fatalf("learner did not appear in members as non-voter")
 
-
 added:
 	for _, n := range nodes {
 		deadline := time.Now().Add(3 * time.Second)
@@ -346,7 +345,7 @@ added:
 	}
 	t.Fatalf("learner was not promoted to voter")
 
-	promoted:
+promoted:
 	_, err = mbr.RemoveNode(raft.PeerSpec{Index: 3})
 	if err != nil {
 		t.Fatalf("remove-node: %v", err)
@@ -362,7 +361,7 @@ added:
 	}
 	t.Fatalf("removed node still present as voter in members")
 
-	removed:
+removed:
 }
 
 func TestClusterGroupMembershipSurvivesLeaderChange(t *testing.T) {

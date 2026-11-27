@@ -226,8 +226,23 @@ func run() (runErr error) {
 	serverErrors := make(chan error, 1)
 	go func() {
 		if *tlsCert != "" {
-			log.Printf("listening with HTTPS on %s", server.Addr)
-			serverErrors <- server.ListenAndServeTLS(*tlsCert, *tlsKey)
+			loader, err := NewCertificateLoader(*tlsCert, *tlsKey)
+			if err != nil {
+				serverErrors <- fmt.Errorf("load TLS certificate: %w", err)
+				return
+			}
+			stopTLSWatch := make(chan struct{})
+			defer close(stopTLSWatch)
+			go loader.watch(stopTLSWatch)
+
+			ln, err := net.Listen("tcp", server.Addr)
+			if err != nil {
+				serverErrors <- fmt.Errorf("listen TCP: %w", err)
+				return
+			}
+			tlsListener := tls.NewListener(ln, loader.tlsConfig())
+			log.Printf("listening with HTTPS on %s (cert hot-reload enabled)", server.Addr)
+			serverErrors <- server.Serve(tlsListener)
 			return
 		}
 		log.Printf("listening with HTTP on %s", server.Addr)
